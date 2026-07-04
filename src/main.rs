@@ -14,6 +14,7 @@
 mod backend;
 mod capture;
 mod keymap;
+mod paste;
 mod proto;
 
 use std::io::{Read, Write};

@@ -26,7 +26,7 @@ Recovered directly from the shipped Electron bundle — not guessed.
 | Command | X11 backend | Wayland backend |
 |---|---|---|
 | `IsReady` → `ACK` | ✅ handshake + keepalive | ✅ |
-| `PasteText` | ✅ clipboard (`xclip`/`xsel`) + XTEST Ctrl+V | ✅ **live-validated** — in-process text/plain+text/html clipboard + uinput Ctrl+V |
+| `PasteText` | ✅ clipboard (`xclip`/`xsel`) + XTEST paste chord | ✅ **live-validated** — in-process text/plain+text/html clipboard + uinput paste chord |
 | `SimulateKeyPress` | ✅ VK→keysym→keycode + XTEST | ✅ VK→evdev + uinput chord (held-modifier snapshot/release) |
 | `GetActiveAppInfo` / `GetAppInfo` | ✅ `_NET_ACTIVE_WINDOW`→PID/`WM_CLASS` | ✅ **KDE** via KWin script bridge; ⬜ other compositors |
 | `GetRunningApps` | ✅ `_NET_CLIENT_LIST` | ⚠️ KDE: active app only (full list TBD); ⬜ other |
@@ -84,6 +84,18 @@ python3 live_inject_test.py target/release/wispr-flow-linux-helper none
 It PasteTexts a marker, overwrites the clipboard with a sentinel, then Ctrl+A/Ctrl+C
 to read the editor back. The automated readback has a clipboard-owner race that can
 report a false negative — the paste landing is verifiable by eye in the editor.
+
+## Paste Chord Override
+
+By default, `PasteText` sets the clipboard and synthesizes `Ctrl+V`. Set
+`WISPR_LINUX_HELPER_PASTE_KEYS=ctrl+shift+v` to use the terminal-friendly paste
+chord instead:
+
+```bash
+WISPR_LINUX_HELPER_PASTE_KEYS=ctrl+shift+v wispr-flow-linux-helper
+```
+
+This is useful for terminals that reserve `Ctrl+V` for literal input.
 
 ## Wiring into the app (Phase 0 packaging)
 

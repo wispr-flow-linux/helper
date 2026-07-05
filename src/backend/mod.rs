@@ -51,7 +51,7 @@ pub struct RunningApp {
 }
 
 pub trait Backend: Send {
-    /// `PasteText`: set the clipboard to `text` (+ optional `html`) and synthesize Ctrl+V.
+    /// `PasteText`: set the clipboard to `text` (+ optional `html`) and synthesize paste chord.
     fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()>;
 
     /// `SimulateKeyPress`: `keycode` is a **Windows VK code** (see keymap.rs); `flags`

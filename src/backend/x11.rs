@@ -4,7 +4,7 @@
 //!   * GetActiveAppInfo  — `_NET_ACTIVE_WINDOW` -> `_NET_WM_PID` (/proc) + `_NET_WM_NAME` + `WM_CLASS`
 //!   * GetRunningApps    — `_NET_CLIENT_LIST` -> per-window `WM_CLASS` / `_NET_WM_NAME`
 //!   * SimulateKeyPress  — VK -> keysym (keymap.rs) -> keycode (server mapping) -> XTEST
-//!   * PasteText         — set clipboard + synth Ctrl+V (Ctrl+V via XTEST)
+//!   * PasteText         — set clipboard + synth paste chord via XTEST
 //!   * GetSelectedText   — copy-probe: save clipboard, Ctrl+C, read, restore (approximate)
 //!
 //! Pragmatic-baseline caveats (marked TODO):
@@ -24,7 +24,7 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _; // provides `sync()`
 
 use super::{ActiveApp, Backend, Result, RunningApp, Selection};
-use crate::keymap;
+use crate::{keymap, paste};
 
 // XTEST `type` field == X event type: KeyPress=2, KeyRelease=3.
 const KEY_PRESS: u8 = 2;
@@ -227,13 +227,20 @@ impl X11Backend {
 
 impl Backend for X11Backend {
     fn paste_text(&mut self, text: &str, _html: Option<&str>) -> Result<()> {
-        // Clipboard-based paste (matches the Windows helper): set clipboard, synth Ctrl+V.
+        // Clipboard-based paste: set clipboard, synthesize the configured paste chord.
         // TODO: save & restore the user's prior clipboard around the paste; offer text/html.
         self.clipboard_set(text)?;
-        // brief settle so the new owner is registered before Ctrl+V reads it
+        // brief settle so the new owner is registered before the paste chord reads it
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let ctrl = keymap::flag_to_keysym("Control").unwrap();
-        self.press_chord(b'v' as u32, &[ctrl])?;
+        let chord = paste::chord()?;
+        let key_keysym = keymap::vk_to_keysym(chord.key_vk)
+            .ok_or_else(|| format!("unmapped paste key VK {}", chord.key_vk))?;
+        let mods: Vec<u32> = chord
+            .flags
+            .iter()
+            .filter_map(|flag| keymap::flag_to_keysym(flag))
+            .collect();
+        self.press_chord(key_keysym, &mods)?;
         Ok(())
     }
 

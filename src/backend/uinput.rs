@@ -41,6 +41,13 @@ const BUS_USB: u16 = 0x03;
 /// We enable the full standard key range so any mapped VK can be injected.
 const KEY_MAX: u16 = 0x2ff;
 
+/// Name this virtual keyboard reports to the kernel (`EVIOCGNAME`). Also read by
+/// `capture::evdev`, which must never watch our own device: it rescans
+/// `/dev/input` for hot-plugged keyboards, and this device is created *after*
+/// capture starts, so only the name distinguishes it. Reading it back would feed
+/// every injected keystroke to the app as a `KeypressEvent`.
+pub const DEVICE_NAME: &str = "Wispr Flow Linux Helper";
+
 pub struct UInput {
     file: File,
 }
@@ -77,7 +84,7 @@ impl UInput {
         // Legacy device-setup path (write a uinput_user_dev, then UI_DEV_CREATE):
         // widely supported and avoids the newer UI_DEV_SETUP/abs_setup structs.
         let mut dev: libc::uinput_user_dev = unsafe { std::mem::zeroed() };
-        let name = b"Wispr Flow Linux Helper";
+        let name = DEVICE_NAME.as_bytes();
         for (i, &b) in name.iter().enumerate() {
             dev.name[i] = b as libc::c_char;
         }

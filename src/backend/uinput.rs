@@ -20,7 +20,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 
 use super::Result;
-use crate::keymap;
 
 // --- evdev event types (<linux/input-event-codes.h>) ---
 const EV_SYN: u16 = 0x00;
@@ -153,17 +152,13 @@ impl UInput {
     /// bug, not the fix — verified: 0 ms → modifier applied, ≥8 ms → dropped.
     /// See docs/learnings/wayland-injection.md.
     ///
-    /// Mirrors the Windows helper's GetKeyState dance: any modifier the user is
-    /// *physically* holding at injection time is released first and restored
-    /// afterwards, so e.g. a held Ctrl doesn't turn our injected `v` into a
-    /// stray Ctrl+V (or our injected Ctrl+V into Ctrl+Shift+V). When
-    /// `/dev/input` isn't readable (no `input` group / uaccess ACL), the held
-    /// set is empty and this degrades to a plain chord — see [`held_modifiers`].
+    /// Unlike the Windows helper, we don't try to release and restore whatever
+    /// modifiers the user is physically holding. Windows keyboard state is
+    /// global, but evdev tracks state separately for each device. The kernel
+    /// ignores a release for a key this device never pressed, and the restore
+    /// leaves the key logically held here, stuck for the whole compositor
+    /// until the device is destroyed. Only touch keys we pressed ourselves.
     pub fn chord(&mut self, key: u16, mods: &[u16]) -> Result<()> {
-        let held = held_modifiers();
-        for &m in &held {
-            let _ = self.key(m, false);
-        }
         for &m in mods {
             self.key(m, true)?;
         }
@@ -172,66 +167,10 @@ impl UInput {
         for &m in mods.iter().rev() {
             self.key(m, false)?;
         }
-        // Restore physically-held modifiers (reverse order). Best-effort.
-        for &m in held.iter().rev() {
-            let _ = self.key(m, true);
-        }
         Ok(())
     }
 }
 
-/// Snapshot the modifier keys the user is *physically* holding right now, by
-/// querying every readable `/dev/input/event*` device with `EVIOCGKEY` (a
-/// bitmap of currently-pressed keycodes) and intersecting with the modifier set.
-///
-/// Returns an empty list — and is therefore a no-op for `chord` — when no event
-/// device is readable. Reading `/dev/input` typically needs the `input` group
-/// or the logind `uaccess` ACL; on sessions without it, the snapshot is simply
-/// skipped (the common case at paste time has no modifier held anyway).
-pub fn held_modifiers() -> Vec<u16> {
-    use std::collections::BTreeSet;
-    // EVIOCGKEY(len) = _IOC(_IOC_READ=2, 'E'=0x45, 0x18, len). KEY_MAX=0x2ff ->
-    // a 96-byte bitmap covers every keycode we care about.
-    const BITMAP_LEN: usize = (KEY_MAX as usize / 8) + 1;
-    let req: libc::c_ulong =
-        ((2u64 << 30) | ((BITMAP_LEN as u64) << 16) | (0x45 << 8) | 0x18) as libc::c_ulong;
-
-    let dir = match std::fs::read_dir("/dev/input") {
-        Ok(d) => d,
-        Err(_) => return Vec::new(),
-    };
-    let mut held = BTreeSet::new();
-    for entry in dir.flatten() {
-        let path = entry.path();
-        let is_event = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|n| n.starts_with("event"));
-        if !is_event {
-            continue;
-        }
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(_) => continue, // not readable -> skip this device
-        };
-        let mut bitmap = [0u8; BITMAP_LEN];
-        let r = unsafe { libc::ioctl(file.as_raw_fd(), req, bitmap.as_mut_ptr()) };
-        if r < 0 {
-            continue;
-        }
-        for &m in keymap::EVDEV_MODIFIERS {
-            let (byte, bit) = (m as usize / 8, m as u32 % 8);
-            if byte < bitmap.len() && (bitmap[byte] >> bit) & 1 == 1 {
-                held.insert(m);
-            }
-        }
-    }
-    held.into_iter().collect()
-}
 
 impl Drop for UInput {
     fn drop(&mut self) {

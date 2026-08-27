@@ -144,13 +144,15 @@ impl UInput {
     /// Press a chord: hold `mods` (in order), tap `key`, release everything in
     /// reverse.
     ///
-    /// CRITICAL: the modifier-down → key-down → key-up → modifier-up events are
-    /// emitted as one *contiguous* batch with **no inter-event sleep**. On
-    /// KWin/Wayland a quiescent gap after a virtual modifier-down causes the
-    /// compositor to drop the modifier before the key arrives, so an injected
-    /// Ctrl+V degrades to a bare `v` (the entire paste path silently failed this
-    /// way). Counter-intuitively, an "observe the modifier" delay here is the
-    /// bug, not the fix — verified: 0 ms → modifier applied, ≥8 ms → dropped.
+    /// Chord timing is compositor-specific. KWin/Wayland requires the
+    /// modifier-down → key-down → key-up → modifier-up sequence to remain
+    /// contiguous: inserting a delay can cause Ctrl+V to degrade to bare `v`.
+    ///
+    /// GNOME/Mutter has the opposite failure mode on some systems: it may need
+    /// time to observe a released physical push-to-talk modifier and short
+    /// delays between synthetic chord events. Keep the zero-delay KWin path
+    /// unchanged and apply the settling/inter-event delays only on GNOME.
+    ///
     /// See docs/learnings/wayland-injection.md.
     ///
     /// Mirrors the Windows helper's GetKeyState dance: any modifier the user is
@@ -160,15 +162,48 @@ impl UInput {
     /// `/dev/input` isn't readable (no `input` group / uaccess ACL), the held
     /// set is empty and this degrades to a plain chord — see [`held_modifiers`].
     pub fn chord(&mut self, key: u16, mods: &[u16]) -> Result<()> {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let gnome = desktop.contains("GNOME");
+
+        if gnome {
+            // Wispr triggers PasteText immediately after a modifier-based
+            // push-to-talk shortcut is released. Give Mutter time to observe
+            // the physical modifier release before synthesizing Ctrl+V.
+            for _ in 0..20 {
+                if held_modifiers().is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+
+            // Small settling delay even if the modifier has just disappeared.
+            std::thread::sleep(std::time::Duration::from_millis(75));
+        }
+
         let held = held_modifiers();
         for &m in &held {
             let _ = self.key(m, false);
         }
+
         for &m in mods {
             self.key(m, true)?;
+            if gnome {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
+
         self.key(key, true)?;
+        if gnome {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
         self.key(key, false)?;
+        if gnome {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
         for &m in mods.iter().rev() {
             self.key(m, false)?;
         }

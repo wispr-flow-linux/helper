@@ -45,6 +45,94 @@ pub struct UInput {
     file: File,
 }
 
+trait EventWriter {
+    fn write_event(&mut self, type_: u16, code: u16, value: i32) -> Result<()>;
+}
+
+impl EventWriter for File {
+    fn write_event(&mut self, type_: u16, code: u16, value: i32) -> Result<()> {
+        let ev = libc::input_event {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_,
+            code,
+            value,
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &ev as *const _ as *const u8,
+                std::mem::size_of::<libc::input_event>(),
+            )
+        };
+        self.write_all(bytes)
+            .map_err(|e| format!("uinput write: {e}"))
+    }
+}
+
+fn write_key(writer: &mut impl EventWriter, code: u16, press: bool) -> Result<()> {
+    writer.write_event(EV_KEY, code, if press { 1 } else { 0 })?;
+    writer.write_event(EV_SYN, SYN_REPORT, 0)
+}
+
+fn write_chord(writer: &mut impl EventWriter, key: u16, mods: &[u16], held: &[u16]) -> Result<()> {
+    // A physical modifier belongs to another evdev device. A synthetic release
+    // can temporarily remove its seat-wide effect while we inject the chord,
+    // but pressing it here afterwards would transfer ownership to this virtual
+    // device. The later physical release cannot clear that synthetic press.
+    for &modifier in held {
+        let _ = write_key(writer, modifier, false);
+    }
+
+    let mut first_error = None;
+    let mut synthetic_modifiers = Vec::new();
+    for &modifier in mods {
+        synthetic_modifiers.push(modifier);
+        if let Err(error) = write_key(writer, modifier, true) {
+            first_error = Some(error);
+            break;
+        }
+    }
+
+    let mut key_may_be_pressed = false;
+    if first_error.is_none() {
+        key_may_be_pressed = true;
+        if let Err(error) = write_key(writer, key, true) {
+            first_error = Some(error);
+        }
+    }
+    if first_error.is_none() {
+        match write_key(writer, key, false) {
+            Ok(()) => key_may_be_pressed = false,
+            Err(error) => first_error = Some(error),
+        }
+    }
+
+    // A failed event write can happen after the kernel accepted the preceding
+    // key-down. Release every key whose press was attempted, preserving the
+    // first operation error while still attempting the complete cleanup.
+    if key_may_be_pressed {
+        if let Err(error) = write_key(writer, key, false) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    for &modifier in synthetic_modifiers.iter().rev() {
+        if let Err(error) = write_key(writer, modifier, false) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 impl UInput {
     /// Probe whether `/dev/uinput` is openable for writing without creating a
     /// device (used by backend detection so we can fall back gracefully).
@@ -110,37 +198,6 @@ impl UInput {
         Ok(UInput { file })
     }
 
-    fn emit(&mut self, type_: u16, code: u16, value: i32) -> Result<()> {
-        let ev = libc::input_event {
-            time: libc::timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            },
-            type_,
-            code,
-            value,
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &ev as *const _ as *const u8,
-                std::mem::size_of::<libc::input_event>(),
-            )
-        };
-        self.file
-            .write_all(bytes)
-            .map_err(|e| format!("uinput write: {e}"))
-    }
-
-    fn syn(&mut self) -> Result<()> {
-        self.emit(EV_SYN, SYN_REPORT, 0)
-    }
-
-    /// Press (value=1) or release (value=0) a single evdev key, with a SYN.
-    pub fn key(&mut self, code: u16, press: bool) -> Result<()> {
-        self.emit(EV_KEY, code, if press { 1 } else { 0 })?;
-        self.syn()
-    }
-
     /// Press a chord: hold `mods` (in order), tap `key`, release everything in
     /// reverse.
     ///
@@ -153,30 +210,16 @@ impl UInput {
     /// bug, not the fix — verified: 0 ms → modifier applied, ≥8 ms → dropped.
     /// See docs/learnings/wayland-injection.md.
     ///
-    /// Mirrors the Windows helper's GetKeyState dance: any modifier the user is
-    /// *physically* holding at injection time is released first and restored
-    /// afterwards, so e.g. a held Ctrl doesn't turn our injected `v` into a
-    /// stray Ctrl+V (or our injected Ctrl+V into Ctrl+Shift+V). When
-    /// `/dev/input` isn't readable (no `input` group / uaccess ACL), the held
-    /// set is empty and this degrades to a plain chord — see [`held_modifiers`].
+    /// Any modifier the user is *physically* holding at injection time is
+    /// released on the synthetic device before the chord so it cannot corrupt
+    /// the injected key. It is deliberately not pressed again on the synthetic
+    /// device: that would transfer the modifier to a device whose later release
+    /// cannot arrive from the physical keyboard. When `/dev/input` isn't
+    /// readable (no `input` group / uaccess ACL), the held set is empty and this
+    /// degrades to a plain chord — see [`held_modifiers`].
     pub fn chord(&mut self, key: u16, mods: &[u16]) -> Result<()> {
         let held = held_modifiers();
-        for &m in &held {
-            let _ = self.key(m, false);
-        }
-        for &m in mods {
-            self.key(m, true)?;
-        }
-        self.key(key, true)?;
-        self.key(key, false)?;
-        for &m in mods.iter().rev() {
-            self.key(m, false)?;
-        }
-        // Restore physically-held modifiers (reverse order). Best-effort.
-        for &m in held.iter().rev() {
-            let _ = self.key(m, true);
-        }
-        Ok(())
+        write_chord(&mut self.file, key, mods, &held)
     }
 }
 
@@ -247,4 +290,62 @@ fn ioctl_set(fd: libc::c_int, req: libc::c_ulong, arg: libc::c_int) -> Result<()
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{write_chord, EventWriter, Result, EV_KEY};
+
+    const KEY_LEFTCTRL: u16 = 29;
+    const KEY_V: u16 = 47;
+    const KEY_LEFTMETA: u16 = 125;
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        event_index: usize,
+        fail_once_at: Option<usize>,
+        pressed: BTreeSet<u16>,
+    }
+
+    impl EventWriter for RecordingWriter {
+        fn write_event(&mut self, type_: u16, code: u16, value: i32) -> Result<()> {
+            let current_index = self.event_index;
+            self.event_index += 1;
+            if self.fail_once_at == Some(current_index) {
+                self.fail_once_at = None;
+                return Err("injected event write failure".into());
+            }
+            if type_ == EV_KEY {
+                if value == 1 {
+                    self.pressed.insert(code);
+                } else if value == 0 {
+                    self.pressed.remove(&code);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn physically_held_modifier_is_not_left_pressed_on_virtual_device() {
+        let mut writer = RecordingWriter::default();
+
+        write_chord(&mut writer, KEY_V, &[KEY_LEFTCTRL], &[KEY_LEFTMETA]).unwrap();
+
+        assert_eq!(writer.pressed, BTreeSet::new());
+    }
+
+    #[test]
+    fn write_failure_releases_synthetic_modifiers() {
+        let mut writer = RecordingWriter {
+            fail_once_at: Some(2),
+            ..RecordingWriter::default()
+        };
+
+        assert!(write_chord(&mut writer, KEY_V, &[KEY_LEFTCTRL], &[]).is_err());
+
+        assert_eq!(writer.pressed, BTreeSet::new());
+    }
 }

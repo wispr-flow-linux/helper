@@ -119,8 +119,11 @@ clipboard_test.py    in-process clipboard offers text/plain + text/html
 1. ✅ **KDE active-app identity + focus events** — done (`backend/kwin.rs`): KWin
    script pushes `windowActivated` → zbus service → cache + `AppInfoUpdate` events
    on fd 3 (gated by `SetFocusChangeDetectorState`).
-2. ✅ **Held-modifier snapshot/restore** (Wayland) — done (`backend/uinput.rs`),
-   guarded on `/dev/input` read access. TODO: X11 `XQueryKeymap` equivalent.
+2. ✅ **Held-modifier isolation** (Wayland) — done (`backend/uinput.rs`),
+   guarded on `/dev/input` read access. Physical modifiers are released around
+   an injected chord but never recreated on the helper's virtual device, and
+   failure cleanup releases every synthetic modifier. TODO: X11 `XQueryKeymap`
+   equivalent.
 3. ✅ **text/plain + text/html clipboard** (Wayland) — done (`backend/wl_clipboard.rs`,
    `ext_data_control`). TODO: X11 in-process selection owner; prior-clipboard
    save/restore (read side still uses `wl-paste`).

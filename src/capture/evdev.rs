@@ -14,7 +14,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use super::{emit_keypress, HeldKeys};
 use crate::backend::EventSink;
@@ -28,6 +29,15 @@ const KEY_RELEASE: i32 = 0;
 // (which carry BTN_* codes but not letter keys).
 const KEY_A: u16 = 30;
 const KEY_Z: u16 = 44;
+
+/// How often the supervisor re-scans `/dev/input` for keyboards it is not
+/// already reading. Polling rather than inotify is deliberate: udev creates the
+/// event node *before* logind applies the `uaccess` ACL, so a fresh node is
+/// routinely unreadable at `IN_CREATE` and readable a few milliseconds later.
+/// Covering that with inotify takes `IN_ATTRIB` plus an open-retry — which is
+/// what a rescan already is, with no race left to lose. One `read_dir` plus one
+/// ioctl per node is microseconds of work.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 
 // Widest keycode we map; a (KEY_MAX/8 + 1)-byte bitmap covers every code.
 const KEY_MAX: usize = 0x2ff;
@@ -48,6 +58,16 @@ const fn eviocgkey() -> libc::c_ulong {
 const fn eviocgbit_key() -> libc::c_ulong {
     ioc_read(0x20 + EV_KEY as u64, BITMAP_LEN as u64)
 }
+
+// EVIOCGNAME(len): the device's human-readable name.  nr = 0x06
+const fn eviocgname() -> libc::c_ulong {
+    ioc_read(0x06, NAME_LEN as u64)
+}
+// Matches the uinput `name[80]` field the kernel copies the name out of.
+const NAME_LEN: usize = 80;
+
+/// Name the helper gives its own uinput virtual keyboard (`backend::uinput`).
+const OWN_INJECTION_NAME: &[u8] = b"Wispr Flow Linux Helper";
 
 fn bit_set(bitmap: &[u8], code: u16) -> bool {
     let (byte, bit) = (code as usize / 8, code as u32 % 8);
@@ -70,9 +90,38 @@ fn is_keyboard(fd: libc::c_int) -> bool {
     bit_set(&bitmap, KEY_A) && bit_set(&bitmap, KEY_Z)
 }
 
-/// Open every readable keyboard under `/dev/input`, returning `(path, file)`
-/// pairs with blocking fds ready for `read`. Empty when none are readable.
-fn open_keyboards() -> Vec<(PathBuf, File)> {
+/// Device paths that currently have a live reader thread, letting a rescan tell
+/// "already reading this one" from "new device". Readers remove their own path
+/// as they exit, which is what makes recovery work: the kernel reuses `eventN`
+/// names, so a device that re-enumerates under its old name is re-adopted on
+/// the next pass.
+type Watched = Arc<Mutex<HashSet<PathBuf>>>;
+
+/// Lock the watched-path set. The release profile is `panic = "abort"`, so a
+/// poisoned mutex is unreachable there; elsewhere the set is still sound to use
+/// as-is, and losing key capture is a worse outcome than reusing it.
+fn lock(watched: &Watched) -> MutexGuard<'_, HashSet<PathBuf>> {
+    watched.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// True if this device is a helper's own injection keyboard. Capture must skip
+/// it: the rescan runs *after* the injection backend is up (the one-shot scan it
+/// replaced ran before, so upstream never met this), and reading our own virtual
+/// keyboard would report every injected character back to the app as a user
+/// keypress. Matching on the name also skips a device left behind by an earlier
+/// helper process, which is equally not real input.
+fn is_own_injection_device(fd: libc::c_int) -> bool {
+    let mut buf = [0u8; NAME_LEN];
+    if unsafe { libc::ioctl(fd, eviocgname(), buf.as_mut_ptr()) } < 0 {
+        return false; // no name to compare; treat as a normal device
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    &buf[..end] == OWN_INJECTION_NAME
+}
+
+/// Open every readable keyboard under `/dev/input` whose path is not in `skip`,
+/// returning `(path, file)` pairs with blocking fds ready for `read`.
+fn open_keyboards(skip: &HashSet<PathBuf>) -> Vec<(PathBuf, File)> {
     let dir = match std::fs::read_dir("/dev/input") {
         Ok(d) => d,
         Err(e) => {
@@ -83,7 +132,7 @@ fn open_keyboards() -> Vec<(PathBuf, File)> {
     let mut out = Vec::new();
     for entry in dir.flatten() {
         let path = entry.path();
-        if !is_event_node(&path) {
+        if !is_event_node(&path) || skip.contains(&path) {
             continue;
         }
         // Blocking fd: open() never blocks on evdev, but read() must, so the
@@ -92,18 +141,66 @@ fn open_keyboards() -> Vec<(PathBuf, File)> {
             Ok(f) => f,
             Err(_) => continue, // not readable -> skip (permission or busy)
         };
-        if is_keyboard(file.as_raw_fd()) {
+        let fd = file.as_raw_fd();
+        if is_keyboard(fd) && !is_own_injection_device(fd) {
             out.push((path, file));
         }
     }
     out
 }
 
-/// Start evdev capture: one reader thread per keyboard. Returns a [`HeldKeys`]
-/// handle, or `None` when no device is readable (so the caller can fall back).
+/// Start a reader thread for every keyboard not already being read. Returns how
+/// many readers were started.
+fn adopt_keyboards(
+    watched: &Watched,
+    events: &EventSink,
+    index: &Arc<AtomicU64>,
+    pid: u32,
+) -> usize {
+    let known = lock(watched).clone();
+    let mut started = 0;
+    for (path, file) in open_keyboards(&known) {
+        log::info!("evdev capture: watching {}", path.display());
+        // Claim the path before spawning: a reader that finishes early must not
+        // race ahead of the insert and leave a stale entry no rescan can clear.
+        lock(watched).insert(path.clone());
+
+        // Bookkeeping rides in the closure rather than `read_device`, so the
+        // reader stays a plain read loop: whatever ends it — ENODEV on unplug,
+        // EOF, any read error — releases the path for the next pass to re-adopt.
+        let reader = {
+            let path = path.clone();
+            let events = events.clone();
+            let index = index.clone();
+            let watched = watched.clone();
+            move || {
+                read_device(&path, file, &events, &index, pid);
+                lock(&watched).remove(&path);
+            }
+        };
+        let builder = std::thread::Builder::new().name("key-capture-evdev".to_string());
+        match builder.spawn(reader) {
+            Ok(_) => started += 1,
+            Err(e) => {
+                log::warn!("evdev capture: failed to spawn reader thread: {e}");
+                lock(watched).remove(&path);
+            }
+        }
+    }
+    started
+}
+
+/// Start evdev capture: one reader thread per keyboard, plus a supervisor that
+/// adopts keyboards appearing later. Returns a [`HeldKeys`] handle, or `None`
+/// when no device is readable (so the caller can fall back).
 pub fn start(events: EventSink) -> Option<Box<dyn HeldKeys>> {
-    let keyboards = open_keyboards();
-    if keyboards.is_empty() {
+    let watched: Watched = Arc::new(Mutex::new(HashSet::new()));
+    let index = Arc::new(AtomicU64::new(0));
+    let pid = std::process::id();
+
+    // First pass is synchronous: the caller picks its capture backend from what
+    // is readable right now, and the warning below has to fire before we return.
+    if adopt_keyboards(&watched, &events, &index, pid) == 0 {
         log::warn!(
             "evdev capture: no readable keyboard under /dev/input — push-to-talk \
              and the in-app shortcut recorder will NOT work. Run \
@@ -112,16 +209,23 @@ pub fn start(events: EventSink) -> Option<Box<dyn HeldKeys>> {
         );
         return None;
     }
-    let index = Arc::new(AtomicU64::new(0));
-    let pid = std::process::id();
-    for (path, file) in keyboards {
-        log::info!("evdev capture: watching {}", path.display());
-        let events = events.clone();
-        let index = index.clone();
-        let builder = std::thread::Builder::new().name("key-capture-evdev".to_string());
-        if let Err(e) = builder.spawn(move || read_device(&path, file, &events, &index, pid)) {
-            log::warn!("evdev capture: failed to spawn reader thread: {e}");
-        }
+
+    // Then keep looking. Without this the helper goes permanently deaf to any
+    // device that re-enumerates: a USB hub losing power across suspend/resume
+    // invalidates every open fd with ENODEV, and the replacement nodes — same
+    // `eventN` names, seconds later — were never reopened. Capture died silently
+    // while `EvdevHeld` kept answering stale-key queries from a fresh scan, so
+    // the app saw a plausible keyboard that simply never pressed anything.
+    let builder = std::thread::Builder::new().name("key-capture-evdev-scan".to_string());
+    let supervise = move || loop {
+        std::thread::sleep(RESCAN_INTERVAL);
+        adopt_keyboards(&watched, &events, &index, pid);
+    };
+    if let Err(e) = builder.spawn(supervise) {
+        log::warn!(
+            "evdev capture: hotplug supervisor not started ({e}) — keyboards that \
+             appear or re-enumerate later will be ignored until restart"
+        );
     }
     Some(Box::new(EvdevHeld))
 }

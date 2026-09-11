@@ -28,7 +28,7 @@ import threading
 import time
 
 DELIM = b"|"
-MARKER = "WISPR-PASTE-OK-4F2A"
+MARKER = "WISPR-PASTE-OK-4F2A café è 中文 🎙 + | apostrophe's\nSecond line"
 
 # Editors that (a) take a file path arg, (b) put the cursor in the document, and
 # (c) save the open file with Ctrl+S without a dialog. Ordered by preference.

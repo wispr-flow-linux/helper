@@ -39,6 +39,7 @@ pub struct WaylandBackend {
     uinput: UInput,
     has_wl_copy: bool,
     has_wl_paste: bool,
+    swap_left_alt_control: bool,
 }
 
 impl WaylandBackend {
@@ -46,6 +47,14 @@ impl WaylandBackend {
         let uinput = UInput::create()?;
         let has_wl_copy = which("wl-copy");
         let has_wl_paste = which("wl-paste");
+        // Read once per helper start; restart after changing keyboard options.
+        let swap_left_alt_control = super::is_gnome()
+            && run_capture(
+                "gsettings",
+                &["get", "org.gnome.desktop.input-sources", "xkb-options"],
+            )
+            .map(|options| options.split('\'').any(|s| s == "ctrl:swap_lalt_lctl"))
+            .unwrap_or(false);
         if !has_wl_copy || !has_wl_paste {
             log::warn!("wl-clipboard not fully present (wl-copy={has_wl_copy}, wl-paste={has_wl_paste}) — \
                         PasteText/selection ops need both; install `wl-clipboard`");
@@ -54,6 +63,7 @@ impl WaylandBackend {
             uinput,
             has_wl_copy,
             has_wl_paste,
+            swap_left_alt_control,
         })
     }
 
@@ -95,6 +105,22 @@ impl WaylandBackend {
         // -n: don't append a trailing newline. Empty clipboard => exit 1; treat as "".
         Ok(run_capture("wl-paste", &["-n"]).unwrap_or_default())
     }
+
+    fn chord(&mut self, key: u16, mods: &[u16]) -> Result<()> {
+        let map = |key| remap_modifier(key, self.swap_left_alt_control);
+        self.uinput
+            .chord(map(key), &mods.iter().copied().map(map).collect::<Vec<_>>())
+    }
+}
+
+// ponytail: handles GNOME's left Alt/Ctrl swap; use the compositor keymap
+// when supporting additional remaps. Physical held-key snapshots stay untouched.
+fn remap_modifier(key: u16, swap_left_alt_control: bool) -> u16 {
+    match (key, swap_left_alt_control) {
+        (29, true) => 56, // logical Control -> physical Left Alt
+        (56, true) => 29, // logical Alt -> physical Left Control
+        _ => key,
+    }
 }
 
 impl Backend for WaylandBackend {
@@ -106,7 +132,7 @@ impl Backend for WaylandBackend {
         std::thread::sleep(std::time::Duration::from_millis(30));
         let ctrl = keymap::flag_to_evdev("Control").unwrap();
         let v = keymap::vk_to_evdev(b'V' as u32).ok_or("no evdev for V")?;
-        self.uinput.chord(v, &[ctrl])
+        self.chord(v, &[ctrl])
     }
 
     fn simulate_key_press(&mut self, keycode_vk: u32, flags: &[String]) -> Result<()> {
@@ -118,7 +144,7 @@ impl Backend for WaylandBackend {
             .collect();
         // TODO: snapshot & release physically-held modifiers around injection
         // (mirrors the Windows helper's GetKeyState dance); needs /dev/input read.
-        self.uinput.chord(key, &mods)
+        self.chord(key, &mods)
     }
 
     fn get_active_app(&mut self) -> Result<ActiveApp> {
@@ -146,7 +172,7 @@ impl Backend for WaylandBackend {
         let saved = self.clipboard_get().unwrap_or_default();
         let ctrl = keymap::flag_to_evdev("Control").unwrap();
         let c = keymap::vk_to_evdev(b'C' as u32).ok_or("no evdev for C")?;
-        self.uinput.chord(c, &[ctrl])?;
+        self.chord(c, &[ctrl])?;
         std::thread::sleep(std::time::Duration::from_millis(80));
         let selected = self.clipboard_get().unwrap_or_default();
         let _ = self.clipboard_set(&saved);
@@ -257,6 +283,26 @@ fn run_capture(prog: &str, args: &[&str]) -> Result<String> {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => return Err(format!("wait {prog}: {e}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remap_modifier;
+    use crate::keymap;
+
+    #[test]
+    fn left_alt_control_swap_preserves_other_keys_and_default_mapping() {
+        let ctrl = keymap::flag_to_evdev("Control").unwrap();
+        let alt = keymap::flag_to_evdev("Alt").unwrap();
+        assert_eq!(remap_modifier(ctrl, true), alt);
+        assert_eq!(remap_modifier(alt, true), ctrl);
+        for key in 0..=0x2ff {
+            assert_eq!(remap_modifier(key, false), key);
+            if key != ctrl && key != alt {
+                assert_eq!(remap_modifier(key, true), key);
+            }
         }
     }
 }

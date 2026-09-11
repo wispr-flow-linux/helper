@@ -38,6 +38,14 @@ Recovered directly from the shipped Electron bundle — not guessed.
 `detect()` picks Wayland when `$WAYLAND_DISPLAY` is set and `/dev/uinput` is
 writable, else X11 (`$DISPLAY`), else a no-op stub.
 
+On GNOME Wayland, injection respects the `ctrl:swap_lalt_lctl` keyboard
+option (swap left Alt and Control). Without translating the physical keys,
+Ctrl+V arrives as Alt+V even though the clipboard contains the transcript.
+The translation applies to paste, copy, and `SimulateKeyPress`; clipboard
+pasting preserves Unicode independently of the typing layout. Restart the
+helper/app after changing this option. Other custom XKB remaps are not yet
+translated; if `gsettings` is unavailable, the default mapping is used.
+
 Design choice: unhandled commands are ACK'd as safe no-ops so the unmodified app
 stays healthy instead of relaunch-looping the helper. See `src/main.rs` dispatch.
 

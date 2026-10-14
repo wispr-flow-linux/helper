@@ -14,6 +14,8 @@
 mod backend;
 mod capture;
 mod keymap;
+mod media;
+mod prefs;
 mod proto;
 
 use std::io::{Read, Write};
@@ -96,8 +98,13 @@ fn main() {
     // handle answers `CheckStaleKeys`. Independent of the focus/injection backend.
     let held_keys = capture::spawn(tx.clone());
     // The backend gets its own sink for async helper-initiated events (focus).
-    let mut be = backend::detect(tx);
+    let mut be = backend::detect(tx.clone());
     log::info!("backend = {}", be.name());
+    // Pauses media around dictation (`shouldPauseAudio`) and reports playback
+    // state; optional, so a missing session bus only loses that feature.
+    let media = media::MediaController::start(tx)
+        .map_err(|e| log::warn!("media: MPRIS unavailable ({e})"))
+        .ok();
 
     let mut decoder = proto::FrameDecoder::default();
     let mut stdin = std::io::stdin();
@@ -123,7 +130,14 @@ fn main() {
                         log::debug!("<- response {} uuid={}", msg.command, msg.uuid);
                         continue;
                     }
-                    handle_request(&mut *be, held_keys.as_ref(), &ipc, &msg, started);
+                    handle_request(
+                        &mut *be,
+                        held_keys.as_ref(),
+                        media.as_ref(),
+                        &ipc,
+                        &msg,
+                        started,
+                    );
                 }
                 Err(e) => log::error!("failed to parse message: {e}; body={body:?}"),
             }
@@ -134,6 +148,7 @@ fn main() {
 fn handle_request(
     be: &mut dyn Backend,
     held_keys: &dyn capture::HeldKeys,
+    media: Option<&media::MediaController>,
     ipc: &IpcWriter,
     msg: &Incoming,
     started: Instant,
@@ -273,6 +288,20 @@ fn handle_request(
                 json!({ "payload": { "staleKeys": stale } }),
                 uuid,
             ));
+        }
+
+        // ---- dictation lifecycle ----
+        "DictationStart" => {
+            if let Some(media) = media {
+                media.on_dictation_start();
+            }
+            ipc.send(&proto::ack(uuid));
+        }
+        "DictationStop" => {
+            if let Some(media) = media {
+                media.on_dictation_stop();
+            }
+            ipc.send(&proto::ack(uuid));
         }
 
         // ---- lifecycle ----

@@ -157,6 +157,20 @@ pub fn error(description: &str, uuid: &str) -> Value {
     )
 }
 
+/// `PasteOutcome` event (helper -> Electron) reporting how a `PasteText` went:
+/// `{ HelperAPIRequest: { PasteOutcome: { payload: { pasteId?, success, timeElapsedMs } }, uuid } }`.
+/// `pasteId` is optional in the app's schema, which rejects a present-but-null
+/// optional, so it is omitted rather than sent as null when the request had none.
+pub fn paste_outcome(paste_id: Option<&str>, success: bool, elapsed_ms: u64, uuid: &str) -> Value {
+    let mut payload = Map::new();
+    if let Some(id) = paste_id {
+        payload.insert("pasteId".to_string(), json!(id));
+    }
+    payload.insert("success".to_string(), json!(success));
+    payload.insert("timeElapsedMs".to_string(), json!(elapsed_ms));
+    request("PasteOutcome", json!({ "payload": payload }), uuid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +187,28 @@ mod tests {
         ] {
             assert_eq!(unescape(&escape(s)), s, "roundtrip failed for {s:?}");
         }
+    }
+
+    // `PasteOutcome` is decoded by the app's quicktype validator; pin the shape.
+    #[test]
+    fn paste_outcome_builds_paste_outcome_request() {
+        let ev = paste_outcome(Some("paste-1"), true, 42, "po-1");
+        let p = &ev["HelperAPIRequest"]["PasteOutcome"]["payload"];
+        assert_eq!(p["pasteId"], "paste-1");
+        assert_eq!(p["success"], true);
+        assert_eq!(p["timeElapsedMs"], 42);
+        assert_eq!(ev["HelperAPIRequest"]["uuid"], "po-1");
+    }
+
+    #[test]
+    fn paste_outcome_omits_absent_paste_id() {
+        let ev = paste_outcome(None, false, 7, "po-2");
+        let p = &ev["HelperAPIRequest"]["PasteOutcome"]["payload"];
+        assert!(
+            p.get("pasteId").is_none(),
+            "absent pasteId must be omitted, not null"
+        );
+        assert_eq!(p["success"], false);
     }
 
     #[test]

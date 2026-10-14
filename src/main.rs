@@ -161,13 +161,28 @@ fn handle_request(
         "PasteText" => {
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
-            match be.paste_text(text, html) {
+            let paste_id = payload.get("pasteId").and_then(Value::as_str).filter(|s| !s.is_empty());
+            let paste_started = Instant::now();
+            let result = be.paste_text(text, html);
+            let elapsed_ms = paste_started.elapsed().as_millis() as u64;
+            match &result {
                 Ok(()) => ipc.send(&proto::ack(uuid)),
                 Err(e) => {
                     log::error!("PasteText failed: {e}");
                     ipc.send(&proto::error(&format!("PasteText failed: {e}"), uuid));
                 }
             }
+            // The app keys its paste bookkeeping on this event: success completes
+            // post-onboarding and gates the follow-up cursor moves; failure shows
+            // the "paste failed" notice with the transcript. `success` reflects
+            // the paste mechanism (clipboard set + Ctrl+V injected) — the helper
+            // cannot observe whether the target app consumed the keystroke.
+            ipc.send(&proto::paste_outcome(
+                paste_id,
+                result.is_ok(),
+                elapsed_ms,
+                &format!("paste-outcome-{uuid}"),
+            ));
         }
         "SimulateKeyPress" => {
             let keycode = payload.get("keycode").and_then(Value::as_u64).unwrap_or(0) as u32;

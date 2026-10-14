@@ -10,7 +10,6 @@
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
@@ -114,8 +113,18 @@ pub fn start(events: EventSink) -> Option<Box<dyn HeldKeys>> {
     }
     let index = Arc::new(AtomicU64::new(0));
     let pid = std::process::id();
+    let mut held = Vec::with_capacity(keyboards.len());
     for (path, file) in keyboards {
         log::info!("evdev capture: watching {}", path.display());
+        // Keep a dup of the reader's fd so `CheckStaleKeys` costs one ioctl per
+        // keyboard instead of re-opening every /dev/input node per query.
+        match file.try_clone() {
+            Ok(dup) => held.push(dup),
+            Err(e) => log::warn!(
+                "evdev capture: cannot dup {} for stale-key queries: {e}",
+                path.display()
+            ),
+        }
         let events = events.clone();
         let index = index.clone();
         let builder = std::thread::Builder::new().name("key-capture-evdev".to_string());
@@ -123,7 +132,7 @@ pub fn start(events: EventSink) -> Option<Box<dyn HeldKeys>> {
             log::warn!("evdev capture: failed to spawn reader thread: {e}");
         }
     }
-    Some(Box::new(EvdevHeld))
+    Some(Box::new(EvdevHeld { keyboards: held }))
 }
 
 /// Blocking read loop for one device: decode `input_event`s and emit a
@@ -168,41 +177,63 @@ fn read_device(path: &Path, mut file: File, events: &EventSink, index: &AtomicU6
     }
 }
 
-/// Stale-key querier backed by `EVIOCGKEY` across all readable event devices.
-struct EvdevHeld;
+/// Stale-key querier backed by `EVIOCGKEY` on the captured keyboards.
+///
+/// It holds dups of the reader threads' fds rather than re-opening
+/// `/dev/input/event*` per query: `open()` on an idle evdev node can wake its
+/// device, and across a typical desktop's switch/audio-jack/HDMI nodes a full
+/// re-scan takes ~0.5 s — past the app's 500 ms `CheckStaleKeys` deadline, so
+/// every reply arrived late and stale-key recovery never ran. Only keyboards
+/// emit `KeypressEvent`s, so they are the only keys the app can ask about.
+struct EvdevHeld {
+    keyboards: Vec<File>,
+}
 
 impl HeldKeys for EvdevHeld {
     fn held_vks(&self) -> HashSet<u32> {
         let mut held = HashSet::new();
-        let dir = match std::fs::read_dir("/dev/input") {
-            Ok(d) => d,
-            Err(_) => return held,
-        };
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if !is_event_node(&path) {
-                continue;
-            }
-            let file = match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&path)
-            {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
+        for file in &self.keyboards {
             let mut bitmap = [0u8; BITMAP_LEN];
+            // Fails (ENODEV) once the keyboard is unplugged; it then holds nothing.
             if unsafe { libc::ioctl(file.as_raw_fd(), eviocgkey(), bitmap.as_mut_ptr()) } < 0 {
                 continue;
             }
-            for code in 0..=KEY_MAX as u16 {
-                if bit_set(&bitmap, code) {
-                    if let Some(vk) = keymap::evdev_to_vk(code) {
-                        held.insert(vk);
-                    }
-                }
-            }
+            held.extend(held_vks_in(&bitmap));
         }
         held
+    }
+}
+
+/// VK codes of the keys set in an `EVIOCGKEY` state bitmap (unmapped codes skipped).
+fn held_vks_in(bitmap: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    (0..=KEY_MAX as u16)
+        .filter(|&code| bit_set(bitmap, code))
+        .filter_map(keymap::evdev_to_vk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bitmap_with(codes: &[u16]) -> [u8; BITMAP_LEN] {
+        let mut bitmap = [0u8; BITMAP_LEN];
+        for &code in codes {
+            bitmap[code as usize / 8] |= 1 << (code % 8);
+        }
+        bitmap
+    }
+
+    #[test]
+    fn held_vks_in_maps_set_bits_to_vk_codes() {
+        // KEY_A (30) -> VK 'A' (65), KEY_LEFTCTRL (29) -> VK_LCONTROL (162).
+        let bitmap = bitmap_with(&[KEY_A, 29]);
+        let mut held: Vec<u32> = held_vks_in(&bitmap).collect();
+        held.sort_unstable();
+        assert_eq!(held, vec![65, 162]);
+    }
+
+    #[test]
+    fn held_vks_in_is_empty_for_a_clear_bitmap() {
+        assert_eq!(held_vks_in(&[0u8; BITMAP_LEN]).count(), 0);
     }
 }

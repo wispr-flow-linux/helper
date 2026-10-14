@@ -14,6 +14,7 @@
 mod backend;
 mod capture;
 mod keymap;
+mod prefs;
 mod proto;
 
 use std::io::{Read, Write};
@@ -96,8 +97,10 @@ fn main() {
     // handle answers `CheckStaleKeys`. Independent of the focus/injection backend.
     let held_keys = capture::spawn(tx.clone());
     // The backend gets its own sink for async helper-initiated events (focus).
-    let mut be = backend::detect(tx);
+    let mut be = backend::detect(tx.clone());
     log::info!("backend = {}", be.name());
+    // Text context for dictations (`TextBoxInfo` / `AppContextUpdate`) over AT-SPI.
+    let context = backend::atspi_ctx::ContextService::start(tx);
 
     let mut decoder = proto::FrameDecoder::default();
     let mut stdin = std::io::stdin();
@@ -123,7 +126,7 @@ fn main() {
                         log::debug!("<- response {} uuid={}", msg.command, msg.uuid);
                         continue;
                     }
-                    handle_request(&mut *be, held_keys.as_ref(), &ipc, &msg, started);
+                    handle_request(&mut *be, held_keys.as_ref(), &context, &ipc, &msg, started);
                 }
                 Err(e) => log::error!("failed to parse message: {e}; body={body:?}"),
             }
@@ -134,6 +137,7 @@ fn main() {
 fn handle_request(
     be: &mut dyn Backend,
     held_keys: &dyn capture::HeldKeys,
+    context: &backend::atspi_ctx::ContextService,
     ipc: &IpcWriter,
     msg: &Incoming,
     started: Instant,
@@ -274,6 +278,18 @@ fn handle_request(
                 uuid,
             ));
         }
+
+        // ---- dictation context ----
+        "DictationStart" => {
+            let include_offscreen = payload
+                .get("includeOffscreen")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            context.on_dictation_start(include_offscreen);
+            ipc.send(&proto::ack(uuid));
+        }
+        // Answered by the context worker with a `TextBoxInfo` response.
+        "GetTextBoxInfo" => context.get_text_box_info(uuid),
 
         // ---- lifecycle ----
         "HelperAppShutdown" => {

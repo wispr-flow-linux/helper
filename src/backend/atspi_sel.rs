@@ -173,7 +173,10 @@ async fn read_selection(conn: &Connection, obj: &ObjectRef) -> Result<Option<Sel
         // for us to read — let the caller fall back.
         .map_err(|e| format!("text proxy: {e}"))?;
 
-    let n = match text.get_nselections().await {
+    // Not `text.get_nselections()`: atspi-proxies 0.6 sends that as
+    // "GetNselections", which no toolkit implements, so it always fails and
+    // every read fell back to the copy-probe. Call the real method by name.
+    let n: i32 = match text.inner().call("GetNSelections", &()).await {
         Ok(n) => n,
         // GetNSelections fails when the object doesn't really implement Text.
         Err(_) => return Ok(None),

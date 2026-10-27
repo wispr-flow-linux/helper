@@ -26,7 +26,7 @@ Recovered directly from the shipped Electron bundle — not guessed.
 | Command | X11 backend | Wayland backend |
 |---|---|---|
 | `IsReady` → `ACK` | ✅ handshake + keepalive | ✅ |
-| `PasteText` | ✅ clipboard (`xclip`/`xsel`) + XTEST Ctrl+V | ✅ **live-validated** — in-process text/plain+text/html clipboard + uinput Ctrl+V |
+| `PasteText` | ✅ clipboard (`xclip`/`xsel`) + XTEST paste chord | ✅ **live-validated** — in-process text/plain+text/html clipboard + uinput paste chord (per-app: Ctrl+Shift+V for terminals, Ctrl+V elsewhere) |
 | `SimulateKeyPress` | ✅ VK→keysym→keycode + XTEST | ✅ VK→evdev + uinput chord (held-modifier snapshot/release) |
 | `GetActiveAppInfo` / `GetAppInfo` | ✅ `_NET_ACTIVE_WINDOW`→PID/`WM_CLASS` | ✅ **KDE** via KWin script bridge; ⬜ other compositors |
 | `GetRunningApps` | ✅ `_NET_CLIENT_LIST` | ⚠️ KDE: active app only (full list TBD); ⬜ other |
@@ -84,6 +84,30 @@ python3 live_inject_test.py target/release/wispr-flow-linux-helper none
 It PasteTexts a marker, overwrites the clipboard with a sentinel, then Ctrl+A/Ctrl+C
 to read the editor back. The automated readback has a clipboard-owner race that can
 report a false negative — the paste landing is verifiable by eye in the editor.
+
+## Paste chord: per-app terminal detection + override
+
+`PasteText` sets the clipboard, then synthesizes a paste chord. Terminals don't
+paste on the stock Ctrl+V (it's quoted-insert in readline, visual-block in vim —
+see wispr-flow-linux/wispr-flow-linux#35), so the chord is chosen per paste:
+
+1. **Focused app is a terminal emulator** (kitty, ghostty, alacritty, konsole,
+   wezterm, foot, xterm, warp, … — list in `src/paste.rs::looks_like_terminal`,
+   matched against the active app's name / `resourceClass`): **Ctrl+Shift+V**.
+   Detection uses the composing `ActiveAppProvider` (KWin bridge / GNOME
+   extension / AT-SPI), so it needs no configuration and leaves non-terminal
+   apps on the stock chord. Unknown focus → Ctrl+V.
+2. **`WISPR_LINUX_HELPER_PASTE_KEYS`** env var, when set, overrides detection
+   globally (`ctrl+v` or `ctrl+shift+v`) — the escape hatch if your terminal
+   isn't in the list or you want one chord everywhere:
+
+```bash
+WISPR_LINUX_HELPER_PASTE_KEYS=ctrl+shift+v wispr-flow-linux-helper
+```
+
+Terminal not detected? The debug log line `paste target: app='…' id='…'
+terminal=…` (stderr, `RUST_LOG=debug`) shows exactly what identity the provider
+reported — PRs extending the list are welcome.
 
 ## Wiring into the app (Phase 0 packaging)
 

@@ -162,7 +162,12 @@ fn handle_request(
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
             match be.paste_text(text, html) {
-                Ok(()) => ipc.send(&proto::ack(uuid)),
+                Ok(()) => {
+                    ipc.send(&proto::ack(uuid));
+                    // Observe the field so corrected words can be auto-learned.
+                    let paste_id = payload.get("pasteId").and_then(Value::as_str).unwrap_or("");
+                    backend::atspi_edit::watch(paste_id.to_string(), text.to_string(), ipc.tx.clone());
+                }
                 Err(e) => {
                     log::error!("PasteText failed: {e}");
                     ipc.send(&proto::error(&format!("PasteText failed: {e}"), uuid));

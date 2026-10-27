@@ -74,6 +74,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 const MAX_DEPTH: usize = 12;
 const MAX_NODES: usize = 400;
 
+/// Most recent widget that gained keyboard focus (not window activations).
+/// Post-paste edit observation (`atspi_edit`) starts from this instead of
+/// walking a possibly huge accessibility tree.
+pub static LAST_FOCUSED_WIDGET: Mutex<Option<ObjectRef>> = Mutex::new(None);
+
 /// State shared between the background focus-watcher thread and the dispatch
 /// thread that reads `current()` / toggles focus detection. Mirrors
 /// `gnome::Shared` field-for-field.
@@ -440,6 +445,11 @@ async fn watch_loop(shared: &Arc<Shared>, stop: &Arc<AtomicBool>) {
             Some(s) => s,
             None => continue,
         };
+        if matches!(ev, Event::Object(_)) {
+            if let Ok(mut last) = LAST_FOCUSED_WIDGET.lock() {
+                *last = Some(source.clone());
+            }
+        }
 
         let app = resolve_active_app(&conn, &source).await;
         // Skip totally-empty resolutions (apps with no a11y at all) so we don't

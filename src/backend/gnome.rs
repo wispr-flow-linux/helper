@@ -420,10 +420,18 @@ fn parse_shell_major(version: &str) -> Option<String> {
     (!major.is_empty() && major.bytes().all(|b| b.is_ascii_digit())).then(|| major.to_string())
 }
 
+/// First GNOME Shell that loads ES-module extensions. extension.js is an ES
+/// module, so no setting makes it load on 42-44 (main repo #50).
+const FIRST_ESM_SHELL: u32 = 45;
+
 /// Whether validation must be disabled for the bridge to load: true when the
 /// shell's major version is absent from the metadata's `shell-version` list
-/// (or the metadata has no usable list, which the shell would reject too).
+/// (or the metadata has no usable list, which the shell would reject too),
+/// unless the shell predates ES-module extensions and cannot load it anyway.
 fn needs_validation_override(major: &str, metadata: &str) -> bool {
+    if major.parse::<u32>().is_ok_and(|m| m < FIRST_ESM_SHELL) {
+        return false;
+    }
     let Ok(meta) = serde_json::from_str::<Value>(metadata) else {
         return true;
     };
@@ -584,6 +592,19 @@ mod tests {
         assert!(!needs_validation_override("50", EXT_METADATA));
         assert!(!needs_validation_override("45", EXT_METADATA));
         assert!(needs_validation_override("99", EXT_METADATA));
+    }
+
+    /// Shells before 45 cannot import an ES-module extension, so flipping the
+    /// shell-wide switch there would change the setting and still not load us.
+    #[test]
+    fn skips_validation_override_before_esm_shells() {
+        assert!(!needs_validation_override("42", EXT_METADATA));
+        assert!(!needs_validation_override("44", EXT_METADATA));
+        assert!(!needs_validation_override("44", "not json"));
+        assert!(needs_validation_override(
+            "45",
+            r#"{"shell-version":["46"]}"#
+        ));
     }
 
     /// Metadata the shell could not match against (not JSON, no list, a

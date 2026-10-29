@@ -330,21 +330,17 @@ impl Backend for X11Backend {
             Ok(None) => log::debug!("AT-SPI: no selection, falling back to copy-probe"),
             Err(e) => log::debug!("AT-SPI unavailable ({e}); falling back to copy-probe"),
         }
-        // Copy-probe fallback: save clipboard, send Ctrl+C, read, restore.
-        // Approximate and destructive-then-restored.
-        let saved = self.clipboard_get().unwrap_or_default();
-        let ctrl = keymap::flag_to_keysym("Control").unwrap();
-        self.press_chord(b'c' as u32, &[ctrl])?;
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        let selected = self.clipboard_get().unwrap_or_default();
-        // restore prior clipboard
-        let _ = self.clipboard_set(&saved);
-        Ok(Selection {
-            selected_text: selected.clone(),
-            contents: selected,
-            before_text: String::new(),
-            after_text: String::new(),
-        })
+        super::copy_probe::get_selection(
+            self,
+            Self::clipboard_get,
+            Self::clipboard_set,
+            |backend| {
+                let ctrl = keymap::flag_to_keysym("Control").unwrap();
+                backend.press_chord(b'c' as u32, &[ctrl])?;
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                Ok(())
+            },
+        )
     }
 
     fn accessibility_status(&mut self) -> bool {

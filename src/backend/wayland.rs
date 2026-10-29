@@ -94,8 +94,9 @@ impl WaylandBackend {
         if !self.has_wl_paste {
             return Err("wl-paste not available".into());
         }
-        // -n: don't append a trailing newline. Empty clipboard => exit 1; treat as "".
-        Ok(run_capture("wl-paste", &["-n"]).unwrap_or_default())
+        // -n: don't append a trailing newline. Propagate errors so a failed
+        // selection probe cannot overwrite clipboard data we could not save.
+        run_capture("wl-paste", &["-n"])
     }
 }
 
@@ -143,21 +144,18 @@ impl Backend for WaylandBackend {
             Ok(None) => log::debug!("AT-SPI: no selection, falling back to copy-probe"),
             Err(e) => log::debug!("AT-SPI unavailable ({e}); falling back to copy-probe"),
         }
-        // Copy-probe fallback: save clipboard, synth Ctrl+C, read, restore.
-        // Approximate and destructive-then-restored.
-        let saved = self.clipboard_get().unwrap_or_default();
-        let ctrl = keymap::flag_to_evdev("Control").unwrap();
-        let c = keymap::vk_to_evdev(b'C' as u32).ok_or("no evdev for C")?;
-        self.uinput.chord(c, &[ctrl])?;
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        let selected = self.clipboard_get().unwrap_or_default();
-        let _ = self.clipboard_set(&saved);
-        Ok(Selection {
-            selected_text: selected.clone(),
-            contents: selected,
-            before_text: String::new(),
-            after_text: String::new(),
-        })
+        super::copy_probe::get_selection(
+            self,
+            Self::clipboard_get,
+            Self::clipboard_set,
+            |backend| {
+                let ctrl = keymap::flag_to_evdev("Control").unwrap();
+                let c = keymap::vk_to_evdev(b'C' as u32).ok_or("no evdev for C")?;
+                backend.uinput.chord(c, &[ctrl])?;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                Ok(())
+            },
+        )
     }
 
     fn accessibility_status(&mut self) -> bool {

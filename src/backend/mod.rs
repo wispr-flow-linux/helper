@@ -8,6 +8,7 @@
 
 pub mod atspi_app;
 pub mod atspi_sel;
+mod copy_probe;
 pub mod gnome;
 pub mod kwin;
 pub mod stub;

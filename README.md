@@ -41,6 +41,20 @@ writable, else X11 (`$DISPLAY`), else a no-op stub.
 Design choice: unhandled commands are ACK'd as safe no-ops so the unmodified app
 stays healthy instead of relaunch-looping the helper. See `src/main.rs` dispatch.
 
+## Right Ctrl-only push-to-talk
+
+The monitor already reports Left Ctrl as VK 162 and Right Ctrl as 163. Wispr's
+settings UI prints both as Ctrl, and a bind recorded on Right Ctrl still fires
+from Left Ctrl. Injection is not involved.
+
+To hide Left Ctrl from the monitor (PTT + shortcut recorder only):
+
+```bash
+export WISPR_CAPTURE_IGNORE_VK=162
+```
+
+Comma-separated list of Windows VK codes. Empty / unset keeps every key.
+
 ## Build
 
 Needs a Rust toolchain (not currently installed on this machine):
@@ -100,6 +114,7 @@ src/
   main.rs            entry: stdin reader, fd3 writer, dispatch, IsReady/ACK
   proto.rs           envelope + framing (escape '+'/'|', delimiter '|') + tests
   keymap.rs          Windows VK -> X11 keysym AND -> Linux evdev KEY_* (from keycodes.json)
+  capture/           global key monitor (evdev / XInput2) → KeypressEvent
   backend/
     mod.rs           Backend trait + types + detect() (Wayland > X11 > stub)
     x11.rs           X11 implementation (XTEST + _NET_* + xclip/xsel)

@@ -112,6 +112,7 @@ test_harness.py      Electron stand-in: scripted handshake/info conversation
 live_inject_test.py  live PasteText + Ctrl+A/Ctrl+C round-trip against a focused editor
 focus_test.py        focus-event (AppInfoUpdate) streaming + SetFocusChangeDetectorState gating
 clipboard_test.py    in-process clipboard offers text/plain + text/html
+hotplug_test.py      evdev capture adopts / re-adopts keyboards appearing after startup
 ```
 
 ## Roadmap (next, in priority order)

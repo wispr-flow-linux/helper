@@ -7,6 +7,7 @@
 //! not a rewrite.
 
 pub mod atspi_app;
+pub mod atspi_edit;
 pub mod atspi_sel;
 pub mod gnome;
 pub mod kwin;

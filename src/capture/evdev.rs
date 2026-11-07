@@ -12,12 +12,12 @@
 //! brand-new event node. An inotify watch on `/dev/input` opens new keyboards
 //! as they appear; a reader whose device is removed drops it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
@@ -28,6 +28,7 @@ use crate::backend::{uinput, EventSink};
 use crate::keymap;
 
 const INPUT_DIR: &str = "/dev/input";
+const SYSFS_INPUT_DIR: &str = "/sys/class/input";
 
 // evdev event type / key-state values (<linux/input-event-codes.h>).
 const EV_KEY: u16 = 0x01;
@@ -77,17 +78,59 @@ fn is_event_node(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with("event"))
 }
 
-/// True if the open device advertises ordinary keyboard keys (KEY_A..KEY_Z) or
+/// True if a key capability bitmap has ordinary keyboard keys (KEY_A..KEY_Z) or
 /// mouse thumb buttons, which filters out touchpads, plain two/three-button
-/// mice, and other event nodes with nothing the app can bind.
+/// mice, joysticks, and other event nodes with nothing the app can bind.
+fn is_bindable(bitmap: &[u8]) -> bool {
+    (bit_set(bitmap, KEY_A) && bit_set(bitmap, KEY_Z))
+        || bit_set(bitmap, BTN_SIDE)
+        || bit_set(bitmap, BTN_EXTRA)
+}
+
+/// [`is_bindable`] for an open device, from `EVIOCGBIT(EV_KEY)`.
 fn is_keyboard(fd: libc::c_int) -> bool {
     let mut bitmap = [0u8; BITMAP_LEN];
     if unsafe { libc::ioctl(fd, eviocgbit_key(), bitmap.as_mut_ptr()) } < 0 {
         return false;
     }
-    (bit_set(&bitmap, KEY_A) && bit_set(&bitmap, KEY_Z))
-        || bit_set(&bitmap, BTN_SIDE)
-        || bit_set(&bitmap, BTN_EXTRA)
+    is_bindable(&bitmap)
+}
+
+/// Decide from sysfs, without opening the node, whether `path` is worth
+/// watching. Opening an evdev node runs the driver's open(), which resumes a
+/// USB HID device from autosuspend, so probing every node by opening it wakes
+/// joysticks, pedals, and anything else plugged in. `None` when sysfs doesn't
+/// have the answer; the caller then opens the node and asks the ioctl.
+fn sysfs_bindable(path: &Path) -> Option<bool> {
+    let dev = Path::new(SYSFS_INPUT_DIR)
+        .join(path.file_name()?)
+        .join("device");
+    let caps = std::fs::read_to_string(dev.join("capabilities/key")).ok()?;
+    if !is_bindable(&parse_sysfs_bitmap(&caps)) {
+        return Some(false);
+    }
+    let name = std::fs::read_to_string(dev.join("name")).ok()?;
+    Some(name.trim_end_matches('\n') != uinput::DEVICE_NAME)
+}
+
+/// Decode a sysfs capability bitmap (`capabilities/key`) into the same byte
+/// layout `EVIOCGBIT` fills. The kernel prints it as hex `unsigned long` words,
+/// most significant first, separated by spaces, with leading zero words left
+/// out. Bits above `KEY_MAX` are dropped.
+fn parse_sysfs_bitmap(s: &str) -> [u8; BITMAP_LEN] {
+    const WORD_BYTES: usize = std::mem::size_of::<libc::c_ulong>();
+    let mut bitmap = [0u8; BITMAP_LEN];
+    for (i, word) in s.split_whitespace().rev().enumerate() {
+        let Ok(word) = libc::c_ulong::from_str_radix(word, 16) else {
+            continue;
+        };
+        for (j, byte) in word.to_le_bytes().into_iter().enumerate() {
+            if let Some(slot) = bitmap.get_mut(i * WORD_BYTES + j) {
+                *slot = byte;
+            }
+        }
+    }
+    bitmap
 }
 
 /// The device's name (`EVIOCGNAME`), or `None` if the ioctl fails.
@@ -105,10 +148,11 @@ struct Capture {
     events: EventSink,
     index: AtomicU64,
     pid: u32,
-    /// Device numbers (`st_rdev`) that have a live reader. A node can be
-    /// reported several times (startup scan, `IN_CREATE`, each `IN_ATTRIB`);
-    /// this keeps it to one reader.
-    watched: Mutex<HashSet<u64>>,
+    /// Live readers by device number (`st_rdev`). A node can be reported
+    /// several times (startup scan, `IN_CREATE`, each `IN_ATTRIB`); this keeps
+    /// it to one reader. The open file is shared so stale-key queries reuse it
+    /// instead of opening nodes again.
+    watched: Mutex<HashMap<u64, Arc<File>>>,
 }
 
 impl Capture {
@@ -128,7 +172,7 @@ impl Capture {
     /// Start a reader for `path` if it is a readable keyboard that isn't
     /// already watched. Returns true when a new reader was started.
     fn try_add(self: &Arc<Self>, path: &Path) -> bool {
-        if !is_event_node(path) {
+        if !is_event_node(path) || sysfs_bindable(path) == Some(false) {
             return false;
         }
         // Blocking fd: open() never blocks on evdev, but read() must, so the
@@ -150,7 +194,17 @@ impl Capture {
             Ok(m) => m.rdev(),
             Err(_) => return false,
         };
-        let fresh = self.watched.lock().is_ok_and(|mut w| w.insert(rdev));
+        let file = Arc::new(file);
+        let fresh = self.watched.lock().is_ok_and(|mut w| {
+            use std::collections::hash_map::Entry;
+            match w.entry(rdev) {
+                Entry::Vacant(slot) => {
+                    slot.insert(file.clone());
+                    true
+                }
+                Entry::Occupied(_) => false,
+            }
+        });
         if !fresh {
             return false;
         }
@@ -160,7 +214,7 @@ impl Capture {
         let thread_path = path.to_path_buf();
         let builder = std::thread::Builder::new().name("key-capture-evdev".to_string());
         let spawned = builder.spawn(move || {
-            read_device(&thread_path, file, &cap.events, &cap.index, cap.pid);
+            read_device(&thread_path, &file, &cap.events, &cap.index, cap.pid);
             if let Ok(mut w) = cap.watched.lock() {
                 w.remove(&rdev);
             }
@@ -188,7 +242,7 @@ pub fn start(events: EventSink) -> Option<Box<dyn HeldKeys>> {
         events,
         index: AtomicU64::new(0),
         pid: std::process::id(),
-        watched: Mutex::new(HashSet::new()),
+        watched: Mutex::new(HashMap::new()),
     });
     let found = cap.scan();
     let hotplug = watch_hotplug(cap.clone());
@@ -210,7 +264,7 @@ pub fn start(events: EventSink) -> Option<Box<dyn HeldKeys>> {
             return None;
         }
     }
-    Some(Box::new(EvdevHeld))
+    Some(Box::new(EvdevHeld(cap)))
 }
 
 /// Watch `/dev/input` and add keyboards as they appear. A new node is created
@@ -294,7 +348,7 @@ fn parse_inotify(buf: &[u8]) -> Vec<Inotify<'_>> {
 
 /// Blocking read loop for one device: decode `input_event`s and emit a
 /// `KeypressEvent` for every key press/release (auto-repeat is ignored).
-fn read_device(path: &Path, mut file: File, events: &EventSink, index: &AtomicU64, pid: u32) {
+fn read_device(path: &Path, mut file: &File, events: &EventSink, index: &AtomicU64, pid: u32) {
     let evsize = std::mem::size_of::<libc::input_event>();
     let mut buf = vec![0u8; evsize * 64];
     loop {
@@ -335,29 +389,19 @@ fn read_device(path: &Path, mut file: File, events: &EventSink, index: &AtomicU6
     }
 }
 
-/// Stale-key querier backed by `EVIOCGKEY` across all readable event devices.
-struct EvdevHeld;
+/// Stale-key querier backed by `EVIOCGKEY` on the devices the readers already
+/// hold open. Keys on any other node never reach the app, so the app can't
+/// believe they are held, and opening those nodes would wake them.
+struct EvdevHeld(Arc<Capture>);
 
 impl HeldKeys for EvdevHeld {
     fn held_vks(&self) -> HashSet<u32> {
         let mut held = HashSet::new();
-        let dir = match std::fs::read_dir(INPUT_DIR) {
-            Ok(d) => d,
+        let files: Vec<Arc<File>> = match self.0.watched.lock() {
+            Ok(w) => w.values().cloned().collect(),
             Err(_) => return held,
         };
-        for entry in dir.flatten() {
-            let path = entry.path();
-            if !is_event_node(&path) {
-                continue;
-            }
-            let file = match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&path)
-            {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
+        for file in files {
             let mut bitmap = [0u8; BITMAP_LEN];
             if unsafe { libc::ioctl(file.as_raw_fd(), eviocgkey(), bitmap.as_mut_ptr()) } < 0 {
                 continue;
@@ -422,5 +466,42 @@ mod tests {
         let mut buf = record(libc::IN_CREATE, "event3", 16);
         buf.extend_from_slice(&[0u8; 5]); // less than a header
         assert_eq!(parse_inotify(&buf), vec![Inotify::Name(b"event3")]);
+    }
+
+    // `capabilities/key` strings captured from real devices (64-bit kernel).
+    const SYSFS_KEYBOARD: &str = "1000000000007 ff800000000007ff febeffdfffefffff fffffffffffffffe";
+    const SYSFS_MOUSE: &str = "1f0000 0 0 0 0"; // BTN_LEFT..BTN_EXTRA
+    const SYSFS_JOYSTICK: &str = "ffffffffffffffff 0 0 0 0 0 0 ffff00000000 0 0 0 0";
+
+    #[test]
+    fn sysfs_bitmap_places_words_least_significant_last() {
+        let mouse = parse_sysfs_bitmap(SYSFS_MOUSE);
+        for code in 0x110..=0x114 {
+            assert!(bit_set(&mouse, code), "BTN 0x{code:x}");
+        }
+        assert!(!bit_set(&mouse, 0x115));
+        assert!(!bit_set(&mouse, KEY_A));
+
+        let joystick = parse_sysfs_bitmap(SYSFS_JOYSTICK);
+        assert!(bit_set(&joystick, 0x120)); // BTN_TRIGGER
+        assert!(bit_set(&joystick, 0x2c0)); // BTN_TRIGGER_HAPPY1
+        assert!(!bit_set(&joystick, 0x110));
+    }
+
+    #[test]
+    fn sysfs_bitmap_classifies_keyboards_and_thumb_button_mice_only() {
+        assert!(is_bindable(&parse_sysfs_bitmap(SYSFS_KEYBOARD)));
+        assert!(is_bindable(&parse_sysfs_bitmap(SYSFS_MOUSE)));
+        assert!(!is_bindable(&parse_sysfs_bitmap(SYSFS_JOYSTICK)));
+        assert!(!is_bindable(&parse_sysfs_bitmap("0"))); // pedals: no keys
+        assert!(!is_bindable(&parse_sysfs_bitmap("70000 0 0 0 0"))); // 3-button mouse
+    }
+
+    #[test]
+    fn sysfs_bitmap_ignores_junk_and_bits_past_key_max() {
+        let words = vec!["ffffffffffffffff"; 20].join(" ");
+        let wide = parse_sysfs_bitmap(&words);
+        assert!(bit_set(&wide, KEY_MAX as u16));
+        assert!(!is_bindable(&parse_sysfs_bitmap("zz\n")));
     }
 }

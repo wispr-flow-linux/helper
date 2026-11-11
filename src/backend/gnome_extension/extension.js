@@ -134,10 +134,11 @@ const CAN_SET_TYPE = typeof Meta.Window.prototype.set_type === 'function';
 // the pill (512x614 in 1.6.1209 and 1.6.1264, bottom-centred), so raising it
 // at that size takes focus from anything small that maps there, including
 // wl-clipboard's surface, which then waits for focus forever and hangs copy
-// and paste. Keep the pill above only while its window is no bigger than
-// this; linux-status-compact.sh in the app repo makes it 200x110.
-const STATUS_ABOVE_MAX_WIDTH = 256;
-const STATUS_ABOVE_MAX_HEIGHT = 160;
+// and paste. Keep the pill above only while its window is no taller than
+// this, so the bottom-docked window stays clear of where new windows map.
+// Width does not matter for that; linux-status-compact.sh in the app repo
+// keeps upstream's width and makes the window 216 px tall.
+const STATUS_ABOVE_MAX_HEIGHT = 240;
 
 // Re-snap tolerance: skip re-positioning if we're already within this many
 // pixels of the target, so our own `position-changed` handler doesn't loop
@@ -517,7 +518,7 @@ export default class WindowBridgeExtension extends Extension {
     }
 
     // Keep the status pill above other windows while its window is small
-    // enough not to trip Mutter's focus refusal (see STATUS_ABOVE_MAX_WIDTH),
+    // enough not to trip Mutter's focus refusal (see STATUS_ABOVE_MAX_HEIGHT),
     // and drop it back to the normal layer while it is not. Without the
     // compact-window patch the pill can then sit behind the focused window,
     // which is the lesser problem.
@@ -527,9 +528,8 @@ export default class WindowBridgeExtension extends Extension {
             // Gone, retitled as a real window, or above on its own already.
             if (!saved || saved.above)
                 return;
-            const {width, height} = win.get_frame_rect();
-            const small = width <= STATUS_ABOVE_MAX_WIDTH &&
-                height <= STATUS_ABOVE_MAX_HEIGHT;
+            const small = win.get_frame_rect().height <=
+                STATUS_ABOVE_MAX_HEIGHT;
             if (small && !win.is_above())
                 win.make_above();
             else if (!small && win.is_above())

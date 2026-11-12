@@ -141,3 +141,34 @@ proprietary code, and is released into the public domain under the
 [Unlicense](UNLICENSE). The app itself remains under its own terms — see the
 [legal posture](https://github.com/wispr-flow-linux/wispr-flow-linux#legal-posture)
 in the main repo.
+
+## Dictation audio muting (draft)
+
+`DictationStart` mutes all PulseAudio-compatible output sinks and
+`DictationStop` restores their previous mute states.
+
+```bash
+cargo build --release --locked
+# Briefly mutes real playback and creates temporary null sinks:
+python3 test_audio_live.py target/release/wispr-flow-linux-helper
+```
+
+This draft is an alternative helper implementation for
+[wispr-flow-linux#120](https://github.com/wispr-flow-linux/wispr-flow-linux/issues/120).
+It always mutes during dictation; wiring the app's mute/pause preferences and
+resolving overlap with
+[wispr-flow-linux#145](https://github.com/wispr-flow-linux/wispr-flow-linux/pull/145)
+are required before release. It does not implement MPRIS pause/resume.
+
+The guard process holds the original per-sink mute states, leaving volume levels,
+stream mute settings, and microphone inputs untouched. It checks for new sinks
+every 150 ms while dictating. Duplicate start/stop commands are idempotent;
+failed restorations and disconnected sinks are retried while the guard runs.
+Closing the helper's pipe, including after a helper SIGKILL, restores playback.
+The guard also handles SIGTERM, SIGINT, and SIGHUP. Killing the guard itself with
+SIGKILL or shutting down the audio server cannot guarantee restoration.
+
+This implementation requires `/usr/bin/pactl` with JSON output and
+`/usr/bin/timeout`. Distribution-independent executable discovery and packaging
+of those runtime dependencies remain integration work. Direct ALSA/JACK output
+that bypasses PulseAudio-compatible sinks is outside this implementation.

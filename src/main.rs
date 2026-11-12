@@ -11,6 +11,7 @@
 //! GetSelectedTextViaCopy, GetAccessibilityStatus). Everything else is ACK'd as a
 //! safe no-op so the app stays healthy. See README.md for what's next.
 
+mod audio;
 mod backend;
 mod capture;
 mod keymap;
@@ -65,6 +66,10 @@ fn spawn_fd3_writer(rx: mpsc::Receiver<Value>) -> std::thread::JoinHandle<()> {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--audio-guard") {
+        audio::run_guard();
+        return;
+    }
     // `--version`: print and exit before any service setup. This is the probe
     // surface for `wispr-flow --doctor` — it proves the binary dynamically
     // links and reaches main() (e.g. catches `GLIBC_… not found` aborts)
@@ -81,6 +86,7 @@ fn main() {
         .target(env_logger::Target::Stderr)
         .init();
 
+    let mut audio = audio::Guard::spawn().expect("start audio restore guard");
     let started = Instant::now();
     log::info!(
         "wispr-flow-linux-helper starting (pid {})",
@@ -123,7 +129,14 @@ fn main() {
                         log::debug!("<- response {} uuid={}", msg.command, msg.uuid);
                         continue;
                     }
-                    handle_request(&mut *be, held_keys.as_ref(), &ipc, &msg, started);
+                    handle_request(
+                        &mut *be,
+                        held_keys.as_ref(),
+                        &ipc,
+                        &msg,
+                        started,
+                        &mut audio,
+                    );
                 }
                 Err(e) => log::error!("failed to parse message: {e}; body={body:?}"),
             }
@@ -137,6 +150,7 @@ fn handle_request(
     ipc: &IpcWriter,
     msg: &Incoming,
     started: Instant,
+    audio: &mut audio::Guard,
 ) {
     let uuid = msg.uuid.as_str();
     // payload-bearing commands wrap their data under `.payload`
@@ -275,6 +289,19 @@ fn handle_request(
             ));
         }
 
+        "DictationStart" | "DictationStop" => {
+            let start = msg.command == "DictationStart";
+            match audio.command(start) {
+                Ok(()) => {
+                    log::info!("[audio-mute] {}", if start { "muted playback" } else { "restored playback" });
+                    ipc.send(&proto::ack(uuid));
+                }
+                Err(e) => {
+                    log::error!("[audio-mute] {e}");
+                    ipc.send(&proto::error(&e, uuid));
+                }
+            }
+        }
         // ---- lifecycle ----
         // Electron resets the dictation's app at every start and refills it
         // only from an AppInfoUpdate that arrives while the dictation is
@@ -286,6 +313,7 @@ fn handle_request(
         "HelperAppShutdown" => {
             log::info!("HelperAppShutdown received — exiting");
             ipc.send(&proto::ack(uuid));
+            let _ = audio.command(false);
             std::process::exit(0);
         }
 

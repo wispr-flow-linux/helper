@@ -46,7 +46,9 @@ stays healthy instead of relaunch-looping the helper. See `src/main.rs` dispatch
 `PasteText` sets the clipboard and then presses a paste chord in the focused
 window. Which chord is decided per paste, first hit wins:
 
-1. `WISPR_LINUX_HELPER_PASTE_KEYS` (e.g. `ctrl+shift+v`) forces one chord everywhere.
+1. `WISPR_LINUX_HELPER_PASTE_KEYS` (e.g. `ctrl+shift+v`) forces one chord
+   everywhere. It has to be set in the environment the Wispr Flow app starts
+   with: the helper inherits the app's environment, not your shell's.
 2. Rules in `~/.config/wispr-flow/paste-rules.json` (`$XDG_CONFIG_HOME` is honoured).
 3. Built-in terminal detection: terminal emulators get Ctrl+Shift+V, because
    Ctrl+V never reaches their paste handler.

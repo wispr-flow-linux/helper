@@ -532,6 +532,13 @@ mod tests {
             ("", "dev.warp.Warp"),
             ("foot", "foot"),
             ("wezterm-gui", "org.wezfurlong.wezterm"),
+            ("rio", "com.raphaelamorim.rio"),
+            ("hyper", "Hyper"),
+            // The GNOME bridge reports the desktop id, `.desktop` suffix included.
+            ("ghostty", "com.mitchellh.ghostty.desktop"),
+            ("kgx", "org.gnome.Console.desktop"),
+            ("ptyxis", "org.gnome.Ptyxis.desktop"),
+            ("", "org.gnome.Console.desktop"),
         ] {
             assert!(looks_like_terminal(name, id), "{name} / {id}");
         }
@@ -545,6 +552,8 @@ mod tests {
             ("warpinator", "org.x.Warpinator"),
             ("football", "com.example.football"),
             ("hyperion", "hyperion"),
+            ("riot", "im.riot.Riot.desktop"),
+            ("", "org.gnome.Console.Extension"),
             ("", ""),
         ] {
             assert!(!looks_like_terminal(name, id), "{name} / {id}");

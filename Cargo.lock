@@ -1444,6 +1444,7 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

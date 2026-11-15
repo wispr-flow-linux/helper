@@ -4,11 +4,12 @@
 //! operations report failure / empty results.
 
 use super::{ActiveApp, Backend, Result, RunningApp, Selection};
+use crate::paste::PasteChord;
 
 pub struct StubBackend;
 
 impl Backend for StubBackend {
-    fn paste_text(&mut self, _text: &str, _html: Option<&str>) -> Result<()> {
+    fn paste_text(&mut self, _text: &str, _html: Option<&str>, _chord: &PasteChord) -> Result<()> {
         Err("no backend available (stub)".into())
     }
     fn simulate_key_press(&mut self, _keycode_vk: u32, _flags: &[String]) -> Result<()> {

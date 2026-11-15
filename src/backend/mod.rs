@@ -16,6 +16,8 @@ pub mod wayland;
 pub mod wl_clipboard;
 pub mod x11;
 
+use crate::paste::PasteChord;
+
 pub type Result<T> = std::result::Result<T, String>;
 
 /// Channel a backend uses to push **helper-initiated** events to fd 3 (e.g.
@@ -51,8 +53,9 @@ pub struct RunningApp {
 }
 
 pub trait Backend: Send {
-    /// `PasteText`: set the clipboard to `text` (+ optional `html`) and synthesize Ctrl+V.
-    fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()>;
+    /// `PasteText`: set the clipboard to `text` (+ optional `html`) and synthesize
+    /// `chord` (picked per focused window by `paste::Rules`).
+    fn paste_text(&mut self, text: &str, html: Option<&str>, chord: &PasteChord) -> Result<()>;
 
     /// `SimulateKeyPress`: `keycode` is a **Windows VK code** (see keymap.rs); `flags`
     /// are modifier names ("Control"/"Shift"/"Alt"/"Command").
@@ -174,8 +177,8 @@ struct Composed {
 }
 
 impl Backend for Composed {
-    fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()> {
-        self.inner.paste_text(text, html)
+    fn paste_text(&mut self, text: &str, html: Option<&str>, chord: &PasteChord) -> Result<()> {
+        self.inner.paste_text(text, html, chord)
     }
 
     fn simulate_key_press(&mut self, keycode_vk: u32, flags: &[String]) -> Result<()> {
@@ -254,6 +257,28 @@ pub fn detect(events: EventSink) -> Box<dyn Backend> {
             log::info!("backend: {} (no active-app provider)", injector.name());
             injector
         }
+    }
+}
+
+/// Identity-only backend for the `paste-rules` CLI: reports the focused window
+/// but never opens `/dev/uinput` or touches the clipboard. On a real X11
+/// session the native `_NET_*` reader is the identity source, so the X11
+/// backend is used there (it injects nothing unless asked to).
+pub fn detect_identity_only(events: EventSink) -> Box<dyn Backend> {
+    let inner: Box<dyn Backend> = if !env_set("WAYLAND_DISPLAY") && env_set("DISPLAY") {
+        match x11::X11Backend::connect() {
+            Ok(b) => Box::new(b),
+            Err(e) => {
+                log::warn!("X11 connect failed ({e}); relying on the active-app provider");
+                Box::new(stub::StubBackend)
+            }
+        }
+    } else {
+        Box::new(stub::StubBackend)
+    };
+    match pick_active_app_provider(events) {
+        Some(provider) => Box::new(Composed { inner, provider }),
+        None => inner,
     }
 }
 

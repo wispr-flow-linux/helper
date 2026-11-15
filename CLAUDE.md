@@ -34,6 +34,8 @@ built only from the documented IPC contract. Released into the public domain
 src/main.rs               stdin reader, fd 3 event writer, command dispatch
 src/proto.rs              envelope + '|' framing with '+' escaping (+ tests)
 src/keymap.rs             Windows VK -> X11 keysym and Linux evdev KEY_*
+src/paste.rs               per-app paste chord: paste-rules.json, terminal detection
+src/paste_cli.rs           `paste-rules` subcommand that edits that file
 src/capture/              global key monitor: xinput.rs (X11), evdev.rs (Wayland)
 src/backend/mod.rs        Backend trait, detect(): Wayland > X11 > stub
 src/backend/x11.rs        XTEST injection, _NET_* window info, xclip/xsel

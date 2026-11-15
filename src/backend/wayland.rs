@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use super::uinput::UInput;
 use super::{ActiveApp, Backend, Result, RunningApp, Selection};
 use crate::keymap;
+use crate::paste::PasteChord;
 
 /// Wayland injection + clipboard + selection. Active-app identity is **not**
 /// handled here: `detect()` selects an `ActiveAppProvider` (KWin / GNOME ext /
@@ -100,15 +101,20 @@ impl WaylandBackend {
 }
 
 impl Backend for WaylandBackend {
-    fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()> {
+    fn paste_text(&mut self, text: &str, html: Option<&str>, chord: &PasteChord) -> Result<()> {
         // Offer text/plain (+ text/html when supplied), like the Windows helper's
-        // dual-format clipboard, then synthesize Ctrl+V.
+        // dual-format clipboard, then synthesize the paste chord.
         self.clipboard_set_rich(text, html)?;
-        // Let the new selection owner register before Ctrl+V reads it.
+        // Let the new selection owner register before the chord reads it.
         std::thread::sleep(std::time::Duration::from_millis(30));
-        let ctrl = keymap::flag_to_evdev("Control").unwrap();
-        let v = keymap::vk_to_evdev(b'V' as u32).ok_or("no evdev for V")?;
-        self.uinput.chord(v, &[ctrl])
+        let key = keymap::vk_to_evdev(chord.key_vk)
+            .ok_or_else(|| format!("unmapped paste key VK {} (no evdev code)", chord.key_vk))?;
+        let mods: Vec<u16> = chord
+            .flags
+            .iter()
+            .filter_map(|f| keymap::flag_to_evdev(f))
+            .collect();
+        self.uinput.chord(key, &mods)
     }
 
     fn simulate_key_press(&mut self, keycode_vk: u32, flags: &[String]) -> Result<()> {

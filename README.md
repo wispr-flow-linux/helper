@@ -26,7 +26,7 @@ Recovered directly from the shipped Electron bundle — not guessed.
 | Command | X11 backend | Wayland backend |
 |---|---|---|
 | `IsReady` → `ACK` | ✅ handshake + keepalive | ✅ |
-| `PasteText` | ✅ clipboard (`xclip`/`xsel`) + XTEST Ctrl+V | ✅ **live-validated** — in-process text/plain+text/html clipboard + uinput Ctrl+V |
+| `PasteText` | ✅ clipboard (`xclip`/`xsel`) + XTEST paste chord | ✅ **live-validated** — in-process text/plain+text/html clipboard + uinput paste chord (per-app, see below) |
 | `SimulateKeyPress` | ✅ VK→keysym→keycode + XTEST | ✅ VK→evdev + uinput chord |
 | `GetActiveAppInfo` / `GetAppInfo` | ✅ `_NET_ACTIVE_WINDOW`→PID/`WM_CLASS` | ✅ **KDE** via KWin script bridge; ⬜ other compositors |
 | `GetRunningApps` | ✅ `_NET_CLIENT_LIST` | ⚠️ KDE: active app only (full list TBD); ⬜ other |
@@ -40,6 +40,50 @@ writable, else X11 (`$DISPLAY`), else a no-op stub.
 
 Design choice: unhandled commands are ACK'd as safe no-ops so the unmodified app
 stays healthy instead of relaunch-looping the helper. See `src/main.rs` dispatch.
+
+## Paste chord per app
+
+`PasteText` sets the clipboard and then presses a paste chord in the focused
+window. Which chord is decided per paste, first hit wins:
+
+1. `WISPR_LINUX_HELPER_PASTE_KEYS` (e.g. `ctrl+shift+v`) forces one chord everywhere.
+2. Rules in `~/.config/wispr-flow/paste-rules.json` (`$XDG_CONFIG_HOME` is honoured).
+3. Built-in terminal detection: terminal emulators get Ctrl+Shift+V, because
+   Ctrl+V never reaches their paste handler.
+4. The file's `default`, else Ctrl+V.
+
+```json
+{
+  "default": "ctrl+v",
+  "detect_terminals": true,
+  "rules": [
+    { "app": "konsole", "title": "tmux$", "keys": "shift+insert" },
+    { "app": "chatgpt", "keys": "ctrl+shift+v" },
+    { "title": "(?i)codex", "keys": "ctrl+shift+v" }
+  ]
+}
+```
+
+- `app`: the app id (WM class / desktop id), its last dot-segment (`konsole`
+  for `org.kde.konsole`) or the process name. Case-insensitive, whole match.
+- `title`: a regex searched in the window title.
+- `keys`: modifiers (`ctrl`, `shift`, `alt`, `super`) plus a letter, a digit,
+  `insert` or `f1`-`f12`.
+
+A rule needs `app`, `title` or both. The file is re-read when it changes, so
+edits apply to the next dictation. A file that fails to parse is logged and
+ignored; pasting keeps working with the built-in behaviour.
+
+The helper binary doubles as the configurator, so it works wherever the helper
+can see the focused window (KDE, GNOME, AT-SPI, X11):
+
+```bash
+wispr-flow-linux-helper paste-rules pick     # focus a window, then choose its chord
+wispr-flow-linux-helper paste-rules list
+wispr-flow-linux-helper paste-rules add --app kitty --keys ctrl+shift+v
+wispr-flow-linux-helper paste-rules remove 2
+wispr-flow-linux-helper paste-rules check
+```
 
 ## Build
 
@@ -100,6 +144,8 @@ src/
   main.rs            entry: stdin reader, fd3 writer, dispatch, IsReady/ACK
   proto.rs           envelope + framing (escape '+'/'|', delimiter '|') + tests
   keymap.rs          Windows VK -> X11 keysym AND -> Linux evdev KEY_* (from keycodes.json)
+  paste.rs           per-app paste chord: paste-rules.json + terminal detection
+  paste_cli.rs       `paste-rules` subcommand (configurator for that file)
   backend/
     mod.rs           Backend trait + types + detect() (Wayland > X11 > stub)
     x11.rs           X11 implementation (XTEST + _NET_* + xclip/xsel)

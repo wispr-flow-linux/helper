@@ -20,6 +20,8 @@ path = "src/main.rs"
 x11rb = { version = "0.13", features = ["xtest", "xinput"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Window-title patterns in paste-rules.json. Already in the tree via env_logger.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 # Raw uinput ioctls for the in-process Wayland virtual keyboard (backend::uinput).
 libc = "0.2"
 # Logging to stderr (fd 2 is the diagnostic channel; fd 1/stdout is non-IPC).

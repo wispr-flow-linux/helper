@@ -14,6 +14,8 @@
 mod backend;
 mod capture;
 mod keymap;
+mod paste;
+mod paste_cli;
 mod proto;
 
 use std::io::{Read, Write};
@@ -76,6 +78,13 @@ fn main() {
         return;
     }
 
+    // `paste-rules ...`: the per-app paste-chord configurator (see paste_cli.rs).
+    // Like `--version`, never taken when Electron spawns the helper.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("paste-rules") {
+        std::process::exit(paste_cli::run(&args[1..]));
+    }
+
     // Logs go to stderr (fd 2). stdout (fd 1) must stay non-IPC.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Stderr)
@@ -98,6 +107,7 @@ fn main() {
     // The backend gets its own sink for async helper-initiated events (focus).
     let mut be = backend::detect(tx);
     log::info!("backend = {}", be.name());
+    let mut paste_rules = paste::Rules::new(paste::rules_path());
 
     let mut decoder = proto::FrameDecoder::default();
     let mut stdin = std::io::stdin();
@@ -123,7 +133,14 @@ fn main() {
                         log::debug!("<- response {} uuid={}", msg.command, msg.uuid);
                         continue;
                     }
-                    handle_request(&mut *be, held_keys.as_ref(), &ipc, &msg, started);
+                    handle_request(
+                        &mut *be,
+                        &mut paste_rules,
+                        held_keys.as_ref(),
+                        &ipc,
+                        &msg,
+                        started,
+                    );
                 }
                 Err(e) => log::error!("failed to parse message: {e}; body={body:?}"),
             }
@@ -133,6 +150,7 @@ fn main() {
 
 fn handle_request(
     be: &mut dyn Backend,
+    paste_rules: &mut paste::Rules,
     held_keys: &dyn capture::HeldKeys,
     ipc: &IpcWriter,
     msg: &Incoming,
@@ -161,7 +179,16 @@ fn handle_request(
         "PasteText" => {
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
-            match be.paste_text(text, html) {
+            // The chord depends on the window that has focus right now (terminals
+            // do not paste on Ctrl+V); an unknown window gets the default chord.
+            let app = be.get_active_app().unwrap_or_default();
+            let (chord, why) = paste_rules.chord_for(&app);
+            log::info!(
+                "paste target: app='{}' id='{}' -> {chord} ({why})",
+                app.app_name,
+                app.bundle_id
+            );
+            match be.paste_text(text, html, &chord) {
                 Ok(()) => ipc.send(&proto::ack(uuid)),
                 Err(e) => {
                     log::error!("PasteText failed: {e}");

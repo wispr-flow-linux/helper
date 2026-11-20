@@ -175,6 +175,20 @@ struct Composed {
 
 impl Backend for Composed {
     fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()> {
+        // Pick the paste chord for the focused app: terminal emulators paste
+        // with Ctrl+Shift+V (Ctrl+V is quoted-insert/visual-block there),
+        // everything else keeps the stock Ctrl+V. Identity is best-effort —
+        // inner (X11 `_NET_*`) first, then the compositor provider; an
+        // unknown target falls back to Ctrl+V. An explicit
+        // `WISPR_LINUX_HELPER_PASTE_KEYS` override beats this detection.
+        let app = self.get_active_app().unwrap_or_default();
+        let is_terminal = crate::paste::looks_like_terminal(&app.app_name, &app.bundle_id);
+        log::debug!(
+            "paste target: app='{}' id='{}' terminal={is_terminal}",
+            app.app_name,
+            app.bundle_id
+        );
+        crate::paste::set_focused_is_terminal(is_terminal);
         self.inner.paste_text(text, html)
     }
 

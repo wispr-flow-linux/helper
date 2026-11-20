@@ -14,6 +14,7 @@
 mod backend;
 mod capture;
 mod keymap;
+mod overlay;
 mod proto;
 
 use std::io::{Read, Write};
@@ -65,6 +66,15 @@ fn spawn_fd3_writer(rx: mpsc::Receiver<Value>) -> std::thread::JoinHandle<()> {
 }
 
 fn main() {
+    // The overlay has its own stdio protocol and never starts key capture.
+    if std::env::args().any(|a| a == "--dictation-overlay") {
+        if let Err(error) = overlay::run() {
+            eprintln!("dictation overlay: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `--version`: print and exit before any service setup. This is the probe
     // surface for `wispr-flow --doctor` — it proves the binary dynamically
     // links and reaches main() (e.g. catches `GLIBC_… not found` aborts)
@@ -100,6 +110,7 @@ fn main() {
     log::info!("backend = {}", be.name());
 
     let mut decoder = proto::FrameDecoder::default();
+    let mut dictation_cues = DictationCues::default();
     let mut stdin = std::io::stdin();
     let mut chunk = [0u8; 8192];
 
@@ -123,7 +134,14 @@ fn main() {
                         log::debug!("<- response {} uuid={}", msg.command, msg.uuid);
                         continue;
                     }
-                    handle_request(&mut *be, held_keys.as_ref(), &ipc, &msg, started);
+                    handle_request(
+                        &mut *be,
+                        held_keys.as_ref(),
+                        &ipc,
+                        &msg,
+                        started,
+                        &mut dictation_cues,
+                    );
                 }
                 Err(e) => log::error!("failed to parse message: {e}; body={body:?}"),
             }
@@ -137,6 +155,7 @@ fn handle_request(
     ipc: &IpcWriter,
     msg: &Incoming,
     started: Instant,
+    dictation_cues: &mut DictationCues,
 ) {
     let uuid = msg.uuid.as_str();
     // payload-bearing commands wrap their data under `.payload`
@@ -282,6 +301,11 @@ fn handle_request(
         "RecordingStarted" => {
             be.set_focus_detection(true);
             ipc.send(&proto::ack(uuid));
+            dictation_cues.set_recording(ipc, uuid, true);
+        }
+        "DictationStop" => {
+            ipc.send(&proto::ack(uuid));
+            dictation_cues.set_recording(ipc, uuid, false);
         }
         "HelperAppShutdown" => {
             log::info!("HelperAppShutdown received — exiting");
@@ -297,5 +321,66 @@ fn handle_request(
             log::debug!("unhandled command '{other}' (uuid={uuid}) — ACK no-op");
             ipc.send(&proto::ack(uuid));
         }
+    }
+}
+
+// Let Electron play the built-in cues so its sound preference and output
+// routing apply. Arm the stop cue only after a confirmed RecordingStarted.
+#[derive(Default)]
+struct DictationCues {
+    recording: bool,
+}
+
+impl DictationCues {
+    fn set_recording(&mut self, ipc: &IpcWriter, uuid: &str, recording: bool) {
+        if std::mem::replace(&mut self.recording, recording) == recording {
+            return;
+        }
+        let command = if recording {
+            "PlayDictationStartSound"
+        } else {
+            "PlayDictationStopSound"
+        };
+        ipc.send(&proto::request(
+            command,
+            Value::Bool(true),
+            &format!("dictation-cue-{uuid}"),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dictation_cues_only_play_for_a_confirmed_recording() {
+        let (tx, rx) = mpsc::channel();
+        let ipc = IpcWriter { tx };
+        let mut cues = DictationCues::default();
+
+        // Failed or cancelled initialization, followed by a normal session
+        // whose start and stop notifications are each repeated.
+        cues.set_recording(&ipc, "failed", false);
+        cues.set_recording(&ipc, "started", true);
+        cues.set_recording(&ipc, "repeat-start", true);
+        cues.set_recording(&ipc, "stopped", false);
+        cues.set_recording(&ipc, "repeat-stop", false);
+
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [
+                proto::request(
+                    "PlayDictationStartSound",
+                    json!(true),
+                    "dictation-cue-started"
+                ),
+                proto::request(
+                    "PlayDictationStopSound",
+                    json!(true),
+                    "dictation-cue-stopped"
+                ),
+            ],
+        );
     }
 }

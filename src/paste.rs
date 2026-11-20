@@ -107,13 +107,7 @@ pub fn looks_like_terminal(app_name: &str, bundle_id: &str) -> bool {
         "rio",
         "hyper",
     ];
-    const EXACT: &[&str] = &[
-        "st",
-        "st-256color",
-        "term",
-        "eterm",
-        "aterm",
-    ];
+    const EXACT: &[&str] = &["st", "st-256color", "term", "eterm", "aterm"];
     const DESKTOP_IDS: &[&str] = &[
         "org.gnome.console",
         "org.gnome.ptyxis",
@@ -140,11 +134,11 @@ fn bounded_match(value: &str, identifier: &str) -> bool {
         let starts_at_boundary = value[..start]
             .chars()
             .next_back()
-            .map_or(true, |c| !c.is_alphanumeric());
+            .is_none_or(|c| !c.is_alphanumeric());
         let ends_at_boundary = value[end..]
             .chars()
             .next()
-            .map_or(true, |c| !c.is_alphanumeric());
+            .is_none_or(|c| !c.is_alphanumeric());
         starts_at_boundary && ends_at_boundary
     })
 }
@@ -203,11 +197,7 @@ mod tests {
             "org.gnome.Ptyxis",
             "org.gnome.Ptyxis.desktop",
         ] {
-            assert_eq!(
-                detected_chord("", bundle_id),
-                CTRL_SHIFT_V,
-                "{bundle_id:?}"
-            );
+            assert_eq!(detected_chord("", bundle_id), CTRL_SHIFT_V, "{bundle_id:?}");
         }
     }
 

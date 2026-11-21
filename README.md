@@ -114,6 +114,36 @@ focus_test.py        focus-event (AppInfoUpdate) streaming + SetFocusChangeDetec
 clipboard_test.py    in-process clipboard offers text/plain + text/html
 ```
 
+## COSMIC Wayland
+
+The compositor supplies running apps and the active window through its
+toplevel protocol. On COSMIC, recognized terminal app IDs use Ctrl+Shift+V.
+The optional layer-shell indicator follows the target window's output where
+reported and handles fractional scaling without taking focus.
+
+## Clipboard mode on Wayland
+
+Set `$XDG_CONFIG_HOME/wispr-flow/clipboard-mode` (default
+`~/.config/wispr-flow/clipboard-mode`) to one of these values:
+
+- `preserve` temporarily offers the transcript for paste and restores the
+  previous selection, including its advertised formats. Requires
+  `ext-data-control`, available on COSMIC.
+- `keep-transcript` leaves the pasted transcript on the clipboard. This is
+  the default when the file is absent.
+
+Use `wispr-flow --clipboard-mode preserve` with a launcher that supports
+Linux preferences. The helper reads the file on each paste. Preserve mode
+reads selections through AT-SPI. A separate Wayland owner retains restored
+data after the helper exits and stops when the selection changes. On systemd
+sessions it runs in its own user scope. Clipboard history managers can observe
+temporary selections. If a clipboard owner cannot provide a safe snapshot,
+use Flow History to recover the text.
+
+Automatic COSMIC dictation is bound to the window active at dictation start.
+If that window or the temporary clipboard selection changes before paste,
+Flow History retains the transcript. Explicit paste uses the current target.
+
 ## Roadmap (next, in priority order)
 
 1. ✅ **KDE active-app identity + focus events** — done (`backend/kwin.rs`): KWin
@@ -124,8 +154,7 @@ clipboard_test.py    in-process clipboard offers text/plain + text/html
    modifier). Neutralising a physically-held modifier would need `EVIOCGRAB` on
    the real device, or deferring the chord until the user lets go.
 3. ✅ **text/plain + text/html clipboard** (Wayland) — done (`backend/wl_clipboard.rs`,
-   `ext_data_control`). TODO: X11 in-process selection owner; prior-clipboard
-   save/restore (read side still uses `wl-paste`).
+   `ext_data_control`). TODO: X11 in-process selection owner and prior-clipboard restoration.
 4. **Full `GetRunningApps` on KDE** — walk `workspace.windowList` in the KWin script.
    **GNOME path** — shell-extension equivalent of the KWin bridge.
 5. **AT-SPI selection** — replace the copy-probe with real `atspi` Text-interface

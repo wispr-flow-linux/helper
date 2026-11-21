@@ -13,8 +13,11 @@
 
 mod backend;
 mod capture;
+mod cosmic;
 mod keymap;
+mod overlay;
 mod proto;
+mod settings;
 
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
@@ -48,8 +51,13 @@ impl IpcWriter {
 /// with a 4th "pipe" stdio entry); we take exclusive ownership for the process
 /// lifetime and never touch fds 0/1/2 here.
 fn spawn_fd3_writer(rx: mpsc::Receiver<Value>) -> std::thread::JoinHandle<()> {
+    let mut file = unsafe { std::fs::File::from_raw_fd(3) };
+    if let Err(error) = rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::CLOEXEC) {
+        // The independent clipboard owner must never retain Electron's IPC fd.
+        log::error!("could not protect helper IPC fd: {error}");
+        std::process::exit(1);
+    }
     std::thread::spawn(move || {
-        let mut file = unsafe { std::fs::File::from_raw_fd(3) };
         for envelope in rx {
             match proto::encode(&envelope) {
                 Ok(frame) => {
@@ -65,13 +73,53 @@ fn spawn_fd3_writer(rx: mpsc::Receiver<Value>) -> std::thread::JoinHandle<()> {
 }
 
 fn main() {
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--clipboard-mode" | "--wayland-capabilities")
+    ) {
+        // Launchers append --version so an earlier helper exits safely before
+        // trying to start key capture or opening the IPC fd.
+        if args.last().is_some_and(|arg| arg == "--version") {
+            args.pop();
+        }
+        let result = match args[0].as_str() {
+            "--clipboard-mode" => settings::clipboard_command(&args[1..]),
+            _ => cosmic::print_capabilities(),
+        };
+        if let Err(error) = result {
+            eprintln!("wispr-flow-linux-helper: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if args
+        .first()
+        .is_some_and(|arg| backend::clipboard_process::is_owner_arg(arg))
+    {
+        if backend::clipboard_process::run().is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // The overlay has its own stdio protocol and never starts key capture.
+    if args.iter().any(|arg| arg == "--dictation-overlay") {
+        if let Err(error) = overlay::run() {
+            eprintln!("dictation overlay: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // `--version`: print and exit before any service setup. This is the probe
     // surface for `wispr-flow --doctor` — it proves the binary dynamically
     // links and reaches main() (e.g. catches `GLIBC_… not found` aborts)
     // without starting key capture, backend detection, or touching fd 3.
     // stdout is safe here: this path is never taken when Electron spawns the
     // helper (it passes no arguments).
-    if std::env::args().any(|a| a == "--version") {
+    if args.iter().any(|arg| arg == "--version") {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         return;
     }
@@ -100,6 +148,7 @@ fn main() {
     log::info!("backend = {}", be.name());
 
     let mut decoder = proto::FrameDecoder::default();
+    let mut dictation_cues = DictationCues::default();
     let mut stdin = std::io::stdin();
     let mut chunk = [0u8; 8192];
 
@@ -123,7 +172,14 @@ fn main() {
                         log::debug!("<- response {} uuid={}", msg.command, msg.uuid);
                         continue;
                     }
-                    handle_request(&mut *be, held_keys.as_ref(), &ipc, &msg, started);
+                    handle_request(
+                        &mut *be,
+                        held_keys.as_ref(),
+                        &ipc,
+                        &msg,
+                        started,
+                        &mut dictation_cues,
+                    );
                 }
                 Err(e) => log::error!("failed to parse message: {e}; body={body:?}"),
             }
@@ -137,6 +193,7 @@ fn handle_request(
     ipc: &IpcWriter,
     msg: &Incoming,
     started: Instant,
+    dictation_cues: &mut DictationCues,
 ) {
     let uuid = msg.uuid.as_str();
     // payload-bearing commands wrap their data under `.payload`
@@ -161,7 +218,12 @@ fn handle_request(
         "PasteText" => {
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
-            match be.paste_text(text, html) {
+            let result = if is_dictation_paste(&payload) {
+                be.paste_dictation(text, html)
+            } else {
+                be.paste_text(text, html)
+            };
+            match result {
                 Ok(()) => ipc.send(&proto::ack(uuid)),
                 Err(e) => {
                     log::error!("PasteText failed: {e}");
@@ -279,8 +341,22 @@ fn handle_request(
         // Electron resets the dictation's app at every start and refills it
         // only from an AppInfoUpdate that arrives while the dictation is
         // running, so re-announce the focused app even if it has not changed.
+        "DictationStart" => {
+            be.begin_dictation(true);
+            ipc.send(&proto::ack(uuid));
+        }
         "RecordingStarted" => {
+            be.begin_dictation(false);
             be.set_focus_detection(true);
+            ipc.send(&proto::ack(uuid));
+            dictation_cues.set_recording(ipc, uuid, true);
+        }
+        "DictationStop" => {
+            ipc.send(&proto::ack(uuid));
+            dictation_cues.set_recording(ipc, uuid, false);
+        }
+        "CancelPaste" => {
+            be.cancel_dictation();
             ipc.send(&proto::ack(uuid));
         }
         "HelperAppShutdown" => {
@@ -297,5 +373,95 @@ fn handle_request(
             log::debug!("unhandled command '{other}' (uuid={uuid}) — ACK no-op");
             ipc.send(&proto::ack(uuid));
         }
+    }
+}
+
+fn is_dictation_paste(payload: &Value) -> bool {
+    // Explicit Paste Last Transcript omits this correlation id.
+    [
+        payload.get("transcriptEntityUUID"),
+        payload
+            .get("logAttributes")
+            .and_then(|attrs| attrs.get("transcriptEntityUuid")),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|id| id.as_str().is_some_and(|id| !id.is_empty()))
+}
+
+// Let Electron play the built-in cues so its sound preference and output
+// routing apply. Arm the stop cue only after a confirmed RecordingStarted.
+#[derive(Default)]
+struct DictationCues {
+    recording: bool,
+}
+
+impl DictationCues {
+    fn set_recording(&mut self, ipc: &IpcWriter, uuid: &str, recording: bool) {
+        if std::mem::replace(&mut self.recording, recording) == recording {
+            return;
+        }
+        let command = if recording {
+            "PlayDictationStartSound"
+        } else {
+            "PlayDictationStopSound"
+        };
+        ipc.send(&proto::request(
+            command,
+            Value::Bool(true),
+            &format!("dictation-cue-{uuid}"),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn distinguishes_automatic_and_explicit_paste_commands() {
+        assert!(super::is_dictation_paste(&serde_json::json!({
+            "pasteId": "one", "logAttributes": {"transcriptEntityUuid": "audio"}
+        })));
+        assert!(super::is_dictation_paste(
+            &serde_json::json!({"transcriptEntityUUID": "audio"})
+        ));
+        assert!(!super::is_dictation_paste(
+            &serde_json::json!({"pasteId": "two"})
+        ));
+        assert!(!super::is_dictation_paste(
+            &serde_json::json!({"transcriptEntityUUID": ""})
+        ));
+    }
+
+    use super::*;
+
+    #[test]
+    fn dictation_cues_only_play_for_a_confirmed_recording() {
+        let (tx, rx) = mpsc::channel();
+        let ipc = IpcWriter { tx };
+        let mut cues = DictationCues::default();
+
+        // Failed or cancelled initialization, followed by a normal session
+        // whose start and stop notifications are each repeated.
+        cues.set_recording(&ipc, "failed", false);
+        cues.set_recording(&ipc, "started", true);
+        cues.set_recording(&ipc, "repeat-start", true);
+        cues.set_recording(&ipc, "stopped", false);
+        cues.set_recording(&ipc, "repeat-stop", false);
+
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [
+                proto::request(
+                    "PlayDictationStartSound",
+                    json!(true),
+                    "dictation-cue-started"
+                ),
+                proto::request(
+                    "PlayDictationStopSound",
+                    json!(true),
+                    "dictation-cue-stopped"
+                ),
+            ],
+        );
     }
 }

@@ -8,6 +8,7 @@
 
 pub mod atspi_app;
 pub mod atspi_sel;
+pub mod clipboard_process;
 pub mod gnome;
 pub mod kwin;
 pub mod stub;
@@ -24,7 +25,7 @@ pub type Result<T> = std::result::Result<T, String>;
 pub type EventSink = std::sync::mpsc::Sender<serde_json::Value>;
 
 /// Result of `GetActiveAppInfo` / `GetAppInfo` (subset we can fill on Linux).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ActiveApp {
     pub app_name: String,
     /// No real "bundle id" on Linux — we use WM_CLASS / desktop-file id / exe basename.
@@ -53,6 +54,27 @@ pub struct RunningApp {
 pub trait Backend: Send {
     /// `PasteText`: set the clipboard to `text` (+ optional `html`) and synthesize Ctrl+V.
     fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()>;
+
+    /// Mark the point at which an automatic dictation chooses its destination.
+    fn begin_dictation(&mut self, _new: bool) {}
+
+    /// Clear the recorded destination on an explicit cancellation.
+    fn cancel_dictation(&mut self) {}
+
+    fn paste_dictation(&mut self, text: &str, html: Option<&str>) -> Result<()> {
+        self.paste_text(text, html)
+    }
+
+    /// Compose app-aware paste where the injector supports it.
+    fn paste_text_for_app(
+        &mut self,
+        text: &str,
+        html: Option<&str>,
+        _app: &ActiveApp,
+        _still_focused: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.paste_text(text, html)
+    }
 
     /// `SimulateKeyPress`: `keycode` is a **Windows VK code** (see keymap.rs); `flags`
     /// are modifier names ("Control"/"Shift"/"Alt"/"Command").
@@ -111,8 +133,17 @@ pub fn active_app_payload(a: &ActiveApp) -> serde_json::Value {
 /// resolution, so the delegating bodies don't recurse). `KwinTracker` names its
 /// accessor `running_apps()`, the others `get_running_apps()` — bridged here.
 pub trait ActiveAppProvider: Send {
+    /// Compositor-backed identity for routing and validating a paste.
+    fn paste_target(&self) -> Option<(u64, ActiveApp)> {
+        None
+    }
+
     fn current(&self) -> Option<ActiveApp>;
     fn get_running_apps(&self) -> Vec<RunningApp>;
+    fn supports_dictation_target(&self) -> bool {
+        false
+    }
+
     fn set_focus_detection(&self, active: bool);
     fn name(&self) -> &'static str;
 }
@@ -171,11 +202,66 @@ impl ActiveAppProvider for atspi_app::AtspiTracker {
 struct Composed {
     inner: Box<dyn Backend>,
     provider: Box<dyn ActiveAppProvider>,
+    dictation: Option<DictationTarget>,
+}
+
+enum DictationTarget {
+    Window(u64, ActiveApp),
+    Unavailable,
+}
+
+impl Composed {
+    fn paste_to(
+        &mut self,
+        text: &str,
+        html: Option<&str>,
+        activation: u64,
+        app: &ActiveApp,
+    ) -> Result<()> {
+        let still_focused = || {
+            self.provider
+                .paste_target()
+                .is_some_and(|(current, _)| current == activation)
+        };
+        if !still_focused() {
+            return Err("focused window changed during dictation; use Wispr Flow History".into());
+        }
+        self.inner
+            .paste_text_for_app(text, html, app, &still_focused)
+    }
 }
 
 impl Backend for Composed {
     fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()> {
+        if let Some((activation, app)) = self.provider.paste_target() {
+            return self.paste_to(text, html, activation, &app);
+        }
         self.inner.paste_text(text, html)
+    }
+
+    fn begin_dictation(&mut self, new: bool) {
+        if self.provider.supports_dictation_target() && (new || self.dictation.is_none()) {
+            self.dictation = Some(match self.provider.paste_target() {
+                Some((activation, app)) => DictationTarget::Window(activation, app),
+                None => DictationTarget::Unavailable,
+            });
+        }
+    }
+
+    fn cancel_dictation(&mut self) {
+        self.dictation = None;
+    }
+
+    fn paste_dictation(&mut self, text: &str, html: Option<&str>) -> Result<()> {
+        if !self.provider.supports_dictation_target() {
+            return self.paste_text(text, html);
+        }
+        match self.dictation.take() {
+            Some(DictationTarget::Window(activation, app)) => {
+                self.paste_to(text, html, activation, &app)
+            }
+            _ => Err("dictation target unavailable; use Wispr Flow History".into()),
+        }
     }
 
     fn simulate_key_press(&mut self, keycode_vk: u32, flags: &[String]) -> Result<()> {
@@ -248,6 +334,7 @@ pub fn detect(events: EventSink) -> Box<dyn Backend> {
             Box::new(Composed {
                 inner: injector,
                 provider: p,
+                dictation: None,
             })
         }
         None => {
@@ -300,7 +387,17 @@ fn pick_injector() -> Box<dyn Backend> {
 fn pick_active_app_provider(events: EventSink) -> Option<Box<dyn ActiveAppProvider>> {
     if env_set("WAYLAND_DISPLAY") {
         // Tier-2 compositor bridge first (richest), AT-SPI as the universal fallback.
-        if wayland::is_kde() {
+        if crate::cosmic::is_cosmic() {
+            match crate::cosmic::CosmicTracker::start(events.clone()) {
+                Ok(tracker) => {
+                    log::info!("active-app: COSMIC Wayland toplevels");
+                    return Some(Box::new(tracker));
+                }
+                Err(error) => {
+                    log::warn!("COSMIC toplevels unavailable ({error}); falling back to AT-SPI")
+                }
+            }
+        } else if wayland::is_kde() {
             match kwin::KwinTracker::start(events.clone()) {
                 Ok(t) => {
                     log::info!("active-app: KWin scripting bridge (KDE)");
@@ -354,4 +451,91 @@ fn is_gnome() -> bool {
     probe("XDG_CURRENT_DESKTOP").contains("GNOME")
         || probe("XDG_SESSION_DESKTOP").contains("GNOME")
         || std::env::var_os("GNOME_SHELL_SESSION_MODE").is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct TestProvider(Arc<Mutex<(u64, ActiveApp)>>);
+
+    impl ActiveAppProvider for TestProvider {
+        fn supports_dictation_target(&self) -> bool {
+            true
+        }
+        fn paste_target(&self) -> Option<(u64, ActiveApp)> {
+            Some(self.0.lock().unwrap().clone())
+        }
+        fn current(&self) -> Option<ActiveApp> {
+            self.paste_target().map(|(_, app)| app)
+        }
+        fn get_running_apps(&self) -> Vec<RunningApp> {
+            Vec::new()
+        }
+        fn set_focus_detection(&self, _: bool) {}
+        fn name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    struct TestInjector(Arc<Mutex<Option<String>>>);
+
+    impl Backend for TestInjector {
+        fn paste_text(&mut self, _: &str, _: Option<&str>) -> Result<()> {
+            Err("the test expects an app-aware paste".into())
+        }
+        fn paste_text_for_app(
+            &mut self,
+            _: &str,
+            _: Option<&str>,
+            app: &ActiveApp,
+            still_focused: &dyn Fn() -> bool,
+        ) -> Result<()> {
+            assert!(still_focused());
+            *self.0.lock().unwrap() = Some(app.bundle_id.clone());
+            Ok(())
+        }
+        fn simulate_key_press(&mut self, _: u32, _: &[String]) -> Result<()> {
+            Ok(())
+        }
+        fn get_active_app(&mut self) -> Result<ActiveApp> {
+            Ok(ActiveApp::default())
+        }
+        fn get_running_apps(&mut self) -> Result<Vec<RunningApp>> {
+            Ok(Vec::new())
+        }
+        fn get_selected_text(&mut self) -> Result<Selection> {
+            Ok(Selection::default())
+        }
+        fn accessibility_status(&mut self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn automatic_paste_stays_bound_to_start_and_manual_paste_uses_current_window() {
+        let app = |name: &str| ActiveApp {
+            bundle_id: name.to_owned(),
+            ..ActiveApp::default()
+        };
+        let focus = Arc::new(Mutex::new((1, app("notes-editor"))));
+        let pasted_in = Arc::new(Mutex::new(None));
+        let mut backend = Composed {
+            inner: Box::new(TestInjector(Arc::clone(&pasted_in))),
+            provider: Box::new(TestProvider(Arc::clone(&focus))),
+            dictation: None,
+        };
+        backend.begin_dictation(true);
+        *focus.lock().unwrap() = (2, app("other-window"));
+        // Recorder confirmation must not retarget a pending dictation.
+        backend.begin_dictation(false);
+        assert!(backend.paste_dictation("synthetic test", None).is_err());
+        assert!(pasted_in.lock().unwrap().is_none());
+        backend.paste_text("synthetic test", None).unwrap();
+        assert_eq!(pasted_in.lock().unwrap().as_deref(), Some("other-window"));
+    }
 }

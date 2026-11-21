@@ -26,6 +26,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use super::clipboard_process::Paste;
 use super::uinput::UInput;
 use super::wl_clipboard::{self, Offer};
 use super::{ActiveApp, Backend, Result, RunningApp, Selection};
@@ -124,34 +125,39 @@ impl WaylandBackend {
         let ctrl = keymap::flag_to_evdev("Control").ok_or("no evdev for Control")?;
         let v = keymap::vk_to_evdev(b'V' as u32).ok_or("no evdev for V")?;
         let shift = keymap::flag_to_evdev("Shift").ok_or("no evdev for Shift")?;
-        let restore = if ClipboardMode::read()? == ClipboardMode::Preserve {
+        if !still_focused() {
+            return Err("focused window changed before paste; use Wispr Flow History".into());
+        }
+        let mut clipboard = if ClipboardMode::read()? == ClipboardMode::Preserve {
             Some(
-                wl_clipboard::prepare_paste(paste_offers(text, html))
-                    .map_err(|error| format!("{error}; use Wispr Flow History"))?
-                    .ok_or("preserving the clipboard requires Wayland ext-data-control")?,
+                Paste::start(text, html)
+                    .map_err(|error| format!("{error}; use Wispr Flow History"))?,
             )
         } else {
             self.clipboard_set_rich(text, html)?;
             None
         };
-        // Give the focused client time to process the new selection before Ctrl+V.
+        // Let the target process the new selection, then check ownership
+        // again immediately before key injection.
         std::thread::sleep(Duration::from_millis(30));
-        let paste = if !still_focused() {
-            Err("focused window changed before paste; use Wispr Flow History".into())
-        } else if terminal {
-            self.uinput.chord(v, &[ctrl, shift])
-        } else {
-            self.uinput.chord(v, &[ctrl])
-        };
-        if let Some(restore) = restore {
-            if let Err(e) = restore
-                .recv_timeout(Duration::from_secs(1))
-                .map_err(|e| e.to_string())
-                .and_then(|result| result)
-            {
-                // The target may already have pasted, so do not report a
-                // paste failure or risk duplicate insertion on retry.
-                log::warn!("could not restore clipboard after paste: {e}");
+        let paste = (|| {
+            if let Some(clipboard) = &mut clipboard {
+                clipboard
+                    .check_current()
+                    .map_err(|error| format!("{error}; use Wispr Flow History"))?;
+            }
+            if !still_focused() {
+                return Err("focused window changed before paste; use Wispr Flow History".into());
+            }
+            if terminal {
+                self.uinput.chord(v, &[ctrl, shift])
+            } else {
+                self.uinput.chord(v, &[ctrl])
+            }
+        })();
+        if let Some(clipboard) = clipboard {
+            if let Err(error) = clipboard.finish(paste.is_ok()) {
+                log::warn!("could not restore clipboard after paste: {error}");
             }
         }
         paste

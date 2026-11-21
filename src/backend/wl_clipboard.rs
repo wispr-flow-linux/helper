@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,12 +41,15 @@ use wayland_protocols::ext::data_control::v1::client::ext_data_control_source_v1
     Event as SourceEvent, ExtDataControlSourceV1,
 };
 
-use super::Result;
+use super::{
+    clipboard_process::{reply, Reply},
+    Result,
+};
 
 /// A MIME type plus the bytes to serve for it.
 pub type Offer = (String, Vec<u8>);
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const SETUP_TIMEOUT: Duration = Duration::from_secs(3);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_SNAPSHOT_FORMATS: usize = 64;
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -61,105 +65,179 @@ struct State {
 }
 
 type MimeTypes = Mutex<Vec<String>>;
-type Completion = mpsc::Sender<Result<()>>;
+struct Clipboard {
+    queue: EventQueue<State>,
+    manager: ExtDataControlManagerV1,
+    device: ExtDataControlDeviceV1,
+    state: State,
+}
+
+impl Clipboard {
+    fn connect() -> Result<Self> {
+        let conn = Connection::connect_to_env().map_err(|e| format!("wl connect: {e}"))?;
+        let (globals, queue) =
+            registry_queue_init::<State>(&conn).map_err(|e| format!("registry init: {e}"))?;
+        let qh = queue.handle();
+        let manager: ExtDataControlManagerV1 = globals
+            .bind(&qh, 1..=1, ())
+            .map_err(|_| "ext_data_control_manager not available")?;
+        let seat: WlSeat = globals
+            .bind(&qh, 1..=9, ())
+            .map_err(|e| format!("wl_seat bind: {e}"))?;
+        let device = manager.get_data_device(&seat, &qh, ());
+        Ok(Self {
+            queue,
+            manager,
+            device,
+            state: State::default(),
+        })
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.queue
+            .roundtrip(&mut self.state)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn set(&mut self, offers: Vec<Offer>, deadline: Instant) -> Result<()> {
+        if Instant::now() >= deadline {
+            return Err("clipboard setup timed out".into());
+        }
+        publish(
+            &self.manager,
+            &self.device,
+            &self.queue.handle(),
+            &mut self.state,
+            offers,
+        );
+        self.sync()
+    }
+
+    fn serve(&mut self) -> Result<()> {
+        while self.state.source.is_some() {
+            self.queue
+                .blocking_dispatch(&mut self.state)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
 
 /// Set the clipboard and serve it until something else takes ownership.
 pub fn set_clipboard(offers: Vec<Offer>) -> Result<()> {
-    match start_owner(offers, None)? {
-        true => Ok(()),
-        false => Err("ext_data_control_manager not available".into()),
-    }
-}
-
-/// Publish a temporary clipboard. Returns None if the protocol is unavailable.
-/// Wait for the receiver after injecting paste so successive dictations cannot
-/// snapshot each other's temporary selections.
-pub fn prepare_paste(offers: Vec<Offer>) -> Result<Option<mpsc::Receiver<Result<()>>>> {
-    let (tx, rx) = mpsc::channel();
-    Ok(start_owner(offers, Some(tx))?.then_some(rx))
-}
-
-fn start_owner(offers: Vec<Offer>, restore: Option<Completion>) -> Result<bool> {
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (ready, result) = mpsc::sync_channel(1);
     let deadline = Instant::now() + SETUP_TIMEOUT;
     std::thread::spawn(move || {
-        if let Err(error) = setup_and_serve(offers, restore, &ready_tx, deadline) {
-            // A disconnected receiver means the caller has already started
-            // pasting. Its completion channel handles restoration errors.
-            let _ = ready_tx.try_send(Err(error));
+        match Clipboard::connect().and_then(|mut clipboard| {
+            clipboard.set(offers, deadline)?;
+            if clipboard.state.source.is_none() {
+                return Err("clipboard changed before paste".into());
+            }
+            Ok(clipboard)
+        }) {
+            Ok(mut clipboard) => {
+                if ready.send(Ok(())).is_ok() {
+                    let _ = clipboard.serve();
+                }
+            }
+            Err(error) => {
+                let _ = ready.send(Err(error));
+            }
         }
     });
-    ready_rx
+    result
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|e| format!("clipboard setup: {e}"))?
+        .map_err(|error| format!("clipboard setup: {error}"))?
 }
 
-fn setup_and_serve(
+pub(super) fn serve_paste(
     offers: Vec<Offer>,
-    restore: Option<Completion>,
-    ready: &mpsc::SyncSender<Result<bool>>,
-    deadline: Instant,
+    input: &mut (impl Read + AsFd),
+    output: &mut impl Write,
 ) -> Result<()> {
-    let conn = Connection::connect_to_env().map_err(|e| format!("wl connect: {e}"))?;
-    let (globals, mut queue) =
-        registry_queue_init::<State>(&conn).map_err(|e| format!("registry init: {e}"))?;
-    let qh = queue.handle();
-    let manager: ExtDataControlManagerV1 = match globals.bind(&qh, 1..=1, ()) {
-        Ok(manager) => manager,
-        Err(_) => {
-            let _ = ready.send(Ok(false));
-            return Ok(());
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    let mut clipboard = Clipboard::connect()?;
+    let saved = snapshot(&mut clipboard.queue, &mut clipboard.state, deadline)?;
+    clipboard.set(offers, deadline)?;
+
+    // A dropped app pipe is an abort. The clipboard owner still restores the
+    // previous selection before becoming independent of the app.
+    let decision = (|| {
+        if clipboard.state.source.is_none() {
+            return Err("clipboard changed before paste".into());
         }
+        reply(output, Reply::Ready)?;
+        if wait_command(&mut clipboard, input)? != Some(b'C') {
+            return Ok(false);
+        }
+        clipboard.sync()?;
+        if clipboard.state.source.is_none() {
+            return Err("clipboard changed before paste".into());
+        }
+        reply(output, Reply::Current)?;
+        Ok(wait_command(&mut clipboard, input)? == Some(b'P'))
+    })();
+    if matches!(decision, Ok(true)) {
+        dispatch_paste_window(&mut clipboard.queue, &mut clipboard.state)?;
+    }
+    // Only replace our own temporary selection. A newer copy always wins.
+    clipboard.sync()?;
+    if clipboard.state.source.is_some() {
+        if saved.is_empty() {
+            clipboard.device.set_selection(None);
+            clipboard.state.source = None;
+            clipboard.sync()?;
+        } else {
+            clipboard.set(saved, Instant::now() + SETUP_TIMEOUT)?;
+        }
+    }
+    let completion = match decision {
+        Ok(_) => Reply::Done,
+        Err(error) => Reply::Error(error),
     };
-    let seat: WlSeat = globals
-        .bind(&qh, 1..=9, ())
-        .map_err(|e| format!("wl_seat bind: {e}"))?;
-    let device = manager.get_data_device(&seat, &qh, ());
-    let mut state = State::default();
+    let _ = reply(output, completion);
+    clipboard.serve()
+}
 
-    let saved = if restore.is_some() {
-        Some(snapshot(&mut queue, &mut state, deadline)?)
-    } else {
-        None
-    };
-    if Instant::now() >= deadline {
-        return Err("clipboard setup timed out".into());
-    }
-    publish(&manager, &device, &qh, &mut state, offers)?;
-    queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
-    if state.source.is_none() {
-        return Err("clipboard changed before paste".into());
-    }
-    let caller_ready = ready.send(Ok(true)).is_ok();
-
-    if let (Some(saved), Some(complete)) = (saved, restore) {
-        let result = (|| {
-            if caller_ready {
-                dispatch_paste_window(&mut queue, &mut state)?;
-            }
-            // Process cancellation before restoring so a copy made during
-            // the paste window takes precedence over the saved selection.
-            queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
-            if state.source.is_some() {
-                if saved.is_empty() {
-                    device.set_selection(None);
-                    state.source = None;
-                } else {
-                    publish(&manager, &device, &qh, &mut state, saved)?;
-                }
-                queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        })();
-        let _ = complete.send(result);
-    }
-
-    while state.source.is_some() {
-        queue
-            .blocking_dispatch(&mut state)
+fn wait_command(clipboard: &mut Clipboard, input: &mut (impl Read + AsFd)) -> Result<Option<u8>> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        clipboard
+            .queue
+            .dispatch_pending(&mut clipboard.state)
             .map_err(|e| e.to_string())?;
+        if clipboard.state.source.is_none() {
+            return Ok(None);
+        }
+        let Some(read) = clipboard.queue.prepare_read() else {
+            continue;
+        };
+        clipboard.queue.flush().map_err(|e| e.to_string())?;
+        let mut fds = [
+            PollFd::from_borrowed_fd(read.connection_fd(), PollFlags::IN),
+            PollFd::new(&*input, PollFlags::IN),
+        ];
+        if !wait_fds(&mut fds, deadline)? {
+            return Ok(None);
+        }
+        let [display, command] = fds.map(|fd| fd.revents());
+        if !display.is_empty() {
+            match read.read() {
+                Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => {}
+                result => {
+                    result.map_err(|e| e.to_string())?;
+                }
+            }
+        } else {
+            drop(read);
+        }
+        if !command.is_empty() {
+            let mut byte = [0];
+            let count = input.read(&mut byte).map_err(|e| e.to_string())?;
+            return Ok((count == 1).then_some(byte[0]));
+        }
     }
-    Ok(())
 }
 
 fn publish(
@@ -168,65 +246,70 @@ fn publish(
     qh: &QueueHandle<State>,
     state: &mut State,
     offers: Vec<Offer>,
-) -> Result<()> {
+) {
     let mimes: Vec<_> = offers.iter().map(|(mime, _)| mime.clone()).collect();
-    let source = manager.create_data_source(qh, ClipboardSource::new(offers)?);
+    let source = manager.create_data_source(qh, ClipboardSource::new(offers));
     for mime in mimes {
         source.offer(mime);
     }
     device.set_selection(Some(&source));
     state.source = Some(source.id());
-    Ok(())
 }
 
 struct ClipboardSource {
     offers: Vec<(String, Arc<[u8]>)>,
-    writer: mpsc::SyncSender<(OwnedFd, Arc<[u8]>, Instant)>,
+    transfers: Arc<AtomicUsize>,
 }
 
 impl ClipboardSource {
-    fn new(offers: Vec<Offer>) -> Result<Self> {
-        let (writer, transfers) = mpsc::sync_channel::<(OwnedFd, Arc<[u8]>, Instant)>(16);
-        std::thread::Builder::new()
-            .name("clipboard-writer".into())
-            .spawn(move || {
-                for (fd, data, deadline) in transfers {
-                    if let Err(error) = send_offer(File::from(fd), &data, deadline) {
-                        log::debug!("clipboard send did not complete: {error}");
-                    }
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        Ok(Self {
+    fn new(offers: Vec<Offer>) -> Self {
+        Self {
             offers: offers
                 .into_iter()
                 .map(|(mime, data)| (mime, data.into()))
                 .collect(),
-            writer,
-        })
+            transfers: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     fn enqueue(&self, mime: &str, fd: OwnedFd) {
-        if let Some((_, data)) = self.offers.iter().find(|(name, _)| name == mime) {
-            // Keep the compositor queue responsive even if a history manager
-            // requests a selection and then stops reading from its pipe.
-            let deadline = Instant::now() + SEND_TIMEOUT;
-            if self
-                .writer
-                .try_send((fd, Arc::clone(data), deadline))
-                .is_err()
-            {
-                log::debug!("clipboard transfer queue is full or closed");
-            }
+        let Some((_, data)) = self.offers.iter().find(|(name, _)| name == mime) else {
+            return;
+        };
+        const MAX_TRANSFERS: usize = 16;
+        if self.transfers.fetch_add(1, Ordering::Relaxed) >= MAX_TRANSFERS {
+            self.transfers.fetch_sub(1, Ordering::Relaxed);
+            log::debug!("clipboard transfer limit reached");
+            return;
+        }
+        let transfers = Arc::clone(&self.transfers);
+        let data = Arc::clone(data);
+        let deadline = Instant::now() + SEND_TIMEOUT;
+        if std::thread::Builder::new()
+            .name("clipboard-writer".into())
+            .spawn(move || {
+                let mut file = File::from(fd);
+                if let Err(error) = write_with_timeout(&mut file, &data, deadline) {
+                    log::debug!("clipboard send did not complete: {error}");
+                }
+                transfers.fetch_sub(1, Ordering::Relaxed);
+            })
+            .is_err()
+        {
+            self.transfers.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
 
-fn send_offer(mut file: File, mut data: &[u8], deadline: Instant) -> Result<()> {
-    let flags = fcntl_getfl(&file).map_err(|error| error.to_string())?;
-    fcntl_setfl(&file, flags | OFlags::NONBLOCK).map_err(|error| error.to_string())?;
+pub(super) fn write_with_timeout(
+    file: &mut File,
+    mut data: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    let flags = fcntl_getfl(&*file).map_err(|error| error.to_string())?;
+    fcntl_setfl(&*file, flags | OFlags::NONBLOCK).map_err(|error| error.to_string())?;
     while !data.is_empty() {
-        if !wait_fds(&mut [PollFd::new(&file, PollFlags::OUT)], deadline)? {
+        if !wait_fds(&mut [PollFd::new(&*file, PollFlags::OUT)], deadline)? {
             return Err("clipboard transfer timed out".into());
         }
         match file.write(data) {
@@ -537,6 +620,23 @@ mod tests {
                 ("text/plain".into(), b"before".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn backpressured_reader_does_not_block_another_reader() {
+        let mime = "text/plain";
+        let data = vec![b'x'; 256 * 1024];
+        let source = ClipboardSource::new(vec![(mime.to_owned(), data.clone())]);
+        let (_stall_reader, stall_writer) = pipe_with(PipeFlags::CLOEXEC).unwrap();
+        let (reader, writer) = pipe_with(PipeFlags::CLOEXEC).unwrap();
+
+        source.enqueue(mime, stall_writer);
+        source.enqueue(mime, writer);
+        assert!(wait_readable(&reader, Instant::now() + PASTE_WINDOW).unwrap());
+
+        let mut received = Vec::new();
+        File::from(reader).read_to_end(&mut received).unwrap();
+        assert_eq!(received, data);
     }
 
     #[test]

@@ -51,8 +51,13 @@ impl IpcWriter {
 /// with a 4th "pipe" stdio entry); we take exclusive ownership for the process
 /// lifetime and never touch fds 0/1/2 here.
 fn spawn_fd3_writer(rx: mpsc::Receiver<Value>) -> std::thread::JoinHandle<()> {
+    let mut file = unsafe { std::fs::File::from_raw_fd(3) };
+    if let Err(error) = rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::CLOEXEC) {
+        // The independent clipboard owner must never retain Electron's IPC fd.
+        log::error!("could not protect helper IPC fd: {error}");
+        std::process::exit(1);
+    }
     std::thread::spawn(move || {
-        let mut file = unsafe { std::fs::File::from_raw_fd(3) };
         for envelope in rx {
             match proto::encode(&envelope) {
                 Ok(frame) => {
@@ -84,6 +89,16 @@ fn main() {
         };
         if let Err(error) = result {
             eprintln!("wispr-flow-linux-helper: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if args
+        .first()
+        .is_some_and(|arg| backend::clipboard_process::is_owner_arg(arg))
+    {
+        if backend::clipboard_process::run().is_err() {
             std::process::exit(1);
         }
         return;
@@ -203,7 +218,12 @@ fn handle_request(
         "PasteText" => {
             let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
             let html = payload.get("htmlText").and_then(Value::as_str).filter(|s| !s.is_empty());
-            match be.paste_text(text, html) {
+            let result = if is_dictation_paste(&payload) {
+                be.paste_dictation(text, html)
+            } else {
+                be.paste_text(text, html)
+            };
+            match result {
                 Ok(()) => ipc.send(&proto::ack(uuid)),
                 Err(e) => {
                     log::error!("PasteText failed: {e}");
@@ -321,7 +341,12 @@ fn handle_request(
         // Electron resets the dictation's app at every start and refills it
         // only from an AppInfoUpdate that arrives while the dictation is
         // running, so re-announce the focused app even if it has not changed.
+        "DictationStart" => {
+            be.begin_dictation(true);
+            ipc.send(&proto::ack(uuid));
+        }
         "RecordingStarted" => {
+            be.begin_dictation(false);
             be.set_focus_detection(true);
             ipc.send(&proto::ack(uuid));
             dictation_cues.set_recording(ipc, uuid, true);
@@ -329,6 +354,10 @@ fn handle_request(
         "DictationStop" => {
             ipc.send(&proto::ack(uuid));
             dictation_cues.set_recording(ipc, uuid, false);
+        }
+        "CancelPaste" => {
+            be.cancel_dictation();
+            ipc.send(&proto::ack(uuid));
         }
         "HelperAppShutdown" => {
             log::info!("HelperAppShutdown received — exiting");
@@ -345,6 +374,19 @@ fn handle_request(
             ipc.send(&proto::ack(uuid));
         }
     }
+}
+
+fn is_dictation_paste(payload: &Value) -> bool {
+    // Explicit Paste Last Transcript omits this correlation id.
+    [
+        payload.get("transcriptEntityUUID"),
+        payload
+            .get("logAttributes")
+            .and_then(|attrs| attrs.get("transcriptEntityUuid")),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|id| id.as_str().is_some_and(|id| !id.is_empty()))
 }
 
 // Let Electron play the built-in cues so its sound preference and output
@@ -374,6 +416,22 @@ impl DictationCues {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn distinguishes_automatic_and_explicit_paste_commands() {
+        assert!(super::is_dictation_paste(&serde_json::json!({
+            "pasteId": "one", "logAttributes": {"transcriptEntityUuid": "audio"}
+        })));
+        assert!(super::is_dictation_paste(
+            &serde_json::json!({"transcriptEntityUUID": "audio"})
+        ));
+        assert!(!super::is_dictation_paste(
+            &serde_json::json!({"pasteId": "two"})
+        ));
+        assert!(!super::is_dictation_paste(
+            &serde_json::json!({"transcriptEntityUUID": ""})
+        ));
+    }
+
     use super::*;
 
     #[test]

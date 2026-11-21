@@ -134,9 +134,15 @@ Set `$XDG_CONFIG_HOME/wispr-flow/clipboard-mode` (default
 
 Use `wispr-flow --clipboard-mode preserve` with a launcher that supports
 Linux preferences. The helper reads the file on each paste. Preserve mode
-reads selections through AT-SPI. If a clipboard owner does not provide a safe
-snapshot, use Flow History to recover the text. Clipboard history managers
-can observe temporary selections as well as persistent ones.
+reads selections through AT-SPI. A separate Wayland owner retains restored
+data after the helper exits and stops when the selection changes. On systemd
+sessions it runs in its own user scope. Clipboard history managers can observe
+temporary selections. If a clipboard owner cannot provide a safe snapshot,
+use Flow History to recover the text.
+
+Automatic COSMIC dictation is bound to the window active at dictation start.
+If that window or the temporary clipboard selection changes before paste,
+Flow History retains the transcript. Explicit paste uses the current target.
 
 ## Roadmap (next, in priority order)
 

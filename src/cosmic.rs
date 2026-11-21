@@ -284,6 +284,10 @@ impl CosmicTracker {
 }
 
 impl ActiveAppProvider for CosmicTracker {
+    fn supports_dictation_target(&self) -> bool {
+        true
+    }
+
     fn paste_target(&self) -> Option<(u64, ActiveApp)> {
         self.0.lock().ok()?.current.clone()
     }

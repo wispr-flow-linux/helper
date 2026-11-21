@@ -24,7 +24,7 @@ pub type Result<T> = std::result::Result<T, String>;
 pub type EventSink = std::sync::mpsc::Sender<serde_json::Value>;
 
 /// Result of `GetActiveAppInfo` / `GetAppInfo` (subset we can fill on Linux).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ActiveApp {
     pub app_name: String,
     /// No real "bundle id" on Linux — we use WM_CLASS / desktop-file id / exe basename.
@@ -53,6 +53,17 @@ pub struct RunningApp {
 pub trait Backend: Send {
     /// `PasteText`: set the clipboard to `text` (+ optional `html`) and synthesize Ctrl+V.
     fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()>;
+
+    /// Compose app-aware paste where the injector supports it.
+    fn paste_text_for_app(
+        &mut self,
+        text: &str,
+        html: Option<&str>,
+        _app: &ActiveApp,
+        _still_focused: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.paste_text(text, html)
+    }
 
     /// `SimulateKeyPress`: `keycode` is a **Windows VK code** (see keymap.rs); `flags`
     /// are modifier names ("Control"/"Shift"/"Alt"/"Command").
@@ -111,6 +122,11 @@ pub fn active_app_payload(a: &ActiveApp) -> serde_json::Value {
 /// resolution, so the delegating bodies don't recurse). `KwinTracker` names its
 /// accessor `running_apps()`, the others `get_running_apps()` — bridged here.
 pub trait ActiveAppProvider: Send {
+    /// Compositor-backed identity for routing and validating a paste.
+    fn paste_target(&self) -> Option<(u64, ActiveApp)> {
+        None
+    }
+
     fn current(&self) -> Option<ActiveApp>;
     fn get_running_apps(&self) -> Vec<RunningApp>;
     fn set_focus_detection(&self, active: bool);
@@ -175,6 +191,16 @@ struct Composed {
 
 impl Backend for Composed {
     fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()> {
+        if let Some((activation, app)) = self.provider.paste_target() {
+            let still_focused = || {
+                self.provider
+                    .paste_target()
+                    .is_some_and(|(current, _)| current == activation)
+            };
+            return self
+                .inner
+                .paste_text_for_app(text, html, &app, &still_focused);
+        }
         self.inner.paste_text(text, html)
     }
 
@@ -300,7 +326,17 @@ fn pick_injector() -> Box<dyn Backend> {
 fn pick_active_app_provider(events: EventSink) -> Option<Box<dyn ActiveAppProvider>> {
     if env_set("WAYLAND_DISPLAY") {
         // Tier-2 compositor bridge first (richest), AT-SPI as the universal fallback.
-        if wayland::is_kde() {
+        if crate::cosmic::is_cosmic() {
+            match crate::cosmic::CosmicTracker::start(events.clone()) {
+                Ok(tracker) => {
+                    log::info!("active-app: COSMIC Wayland toplevels");
+                    return Some(Box::new(tracker));
+                }
+                Err(error) => {
+                    log::warn!("COSMIC toplevels unavailable ({error}); falling back to AT-SPI")
+                }
+            }
+        } else if wayland::is_kde() {
             match kwin::KwinTracker::start(events.clone()) {
                 Ok(t) => {
                     log::info!("active-app: KWin scripting bridge (KDE)");

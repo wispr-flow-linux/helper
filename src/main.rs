@@ -13,9 +13,11 @@
 
 mod backend;
 mod capture;
+mod cosmic;
 mod keymap;
 mod overlay;
 mod proto;
+mod settings;
 
 use std::io::{Read, Write};
 use std::os::unix::io::FromRawFd;
@@ -66,8 +68,29 @@ fn spawn_fd3_writer(rx: mpsc::Receiver<Value>) -> std::thread::JoinHandle<()> {
 }
 
 fn main() {
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    if matches!(
+        args.first().map(String::as_str),
+        Some("--clipboard-mode" | "--wayland-capabilities")
+    ) {
+        // Launchers append --version so an earlier helper exits safely before
+        // trying to start key capture or opening the IPC fd.
+        if args.last().is_some_and(|arg| arg == "--version") {
+            args.pop();
+        }
+        let result = match args[0].as_str() {
+            "--clipboard-mode" => settings::clipboard_command(&args[1..]),
+            _ => cosmic::print_capabilities(),
+        };
+        if let Err(error) = result {
+            eprintln!("wispr-flow-linux-helper: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // The overlay has its own stdio protocol and never starts key capture.
-    if std::env::args().any(|a| a == "--dictation-overlay") {
+    if args.iter().any(|arg| arg == "--dictation-overlay") {
         if let Err(error) = overlay::run() {
             eprintln!("dictation overlay: {error}");
             std::process::exit(1);
@@ -81,7 +104,7 @@ fn main() {
     // without starting key capture, backend detection, or touching fd 3.
     // stdout is safe here: this path is never taken when Electron spawns the
     // helper (it passes no arguments).
-    if std::env::args().any(|a| a == "--version") {
+    if args.iter().any(|arg| arg == "--version") {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         return;
     }

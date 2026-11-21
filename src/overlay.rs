@@ -7,12 +7,19 @@ use std::os::fd::AsFd;
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::fs::{memfd_create, MemfdFlags};
 use tiny_skia::{Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
-use wayland_client::backend::WaylandError;
+use wayland_client::backend::{ObjectId, WaylandError};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
-use wayland_client::protocol::{wl_buffer, wl_callback, wl_compositor, wl_region};
+use wayland_client::protocol::{wl_buffer, wl_callback, wl_compositor, wl_output, wl_region};
 use wayland_client::protocol::{wl_registry, wl_shm};
 use wayland_client::protocol::{wl_shm_pool, wl_surface};
-use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
+use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle};
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1};
 use zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1};
@@ -22,7 +29,8 @@ type Result<T> = std::result::Result<T, OverlayError>;
 
 const WIDTH: u32 = 68;
 const HEIGHT: u32 = 32;
-const SCALE: i32 = 2;
+const SCALE_UNIT: u32 = 120;
+const DEFAULT_SCALE: u32 = 2 * SCALE_UNIT;
 
 #[derive(Clone, Copy)]
 enum Phase {
@@ -31,17 +39,29 @@ enum Phase {
     Processing,
 }
 
+struct Frame {
+    surface: ObjectId,
+    revision: u64,
+}
+
 struct Surface {
     wl: wl_surface::WlSurface,
     role: ZwlrLayerSurfaceV1,
     phase: Phase,
     revision: u64,
     configured: bool,
+    output: Option<wl_output::WlOutput>,
+    scaling: Option<(WpFractionalScaleV1, WpViewport)>,
+    scale: u32,
 }
 
 impl Surface {
     fn destroy(self) {
         self.role.destroy();
+        if let Some((fractional, viewport)) = self.scaling {
+            fractional.destroy();
+            viewport.destroy();
+        }
         self.wl.destroy();
     }
 }
@@ -50,6 +70,8 @@ struct Overlay {
     compositor: wl_compositor::WlCompositor,
     shell: ZwlrLayerShellV1,
     shm: wl_shm::WlShm,
+    scaling: Option<(WpFractionalScaleManagerV1, WpViewporter)>,
+    toplevels: Option<crate::cosmic::Toplevels>,
     surface: Option<Surface>,
     error: Option<OverlayError>,
 }
@@ -58,10 +80,17 @@ pub fn run() -> Result<()> {
     let connection = Connection::connect_to_env()?;
     let (globals, mut queue) = registry_queue_init::<Overlay>(&connection)?;
     let qh = queue.handle();
+    let scaling = globals
+        .bind(&qh, 1..=1, ())
+        .ok()
+        .zip(globals.bind(&qh, 1..=1, ()).ok());
+    let toplevels = crate::cosmic::Toplevels::connect(&connection).ok();
     let mut overlay = Overlay {
         compositor: globals.bind(&qh, 3..=6, ())?,
         shell: globals.bind(&qh, 1..=4, ())?,
         shm: globals.bind(&qh, 1..=1, ())?,
+        scaling,
+        toplevels,
         surface: None,
         error: None,
     };
@@ -70,6 +99,9 @@ pub fn run() -> Result<()> {
     let mut pending = String::new();
 
     loop {
+        if let Some(toplevels) = &mut overlay.toplevels {
+            toplevels.dispatch_pending()?;
+        }
         queue.dispatch_pending(&mut overlay)?;
         if let Some(error) = overlay.error.take() {
             return Err(error);
@@ -155,16 +187,45 @@ impl Overlay {
             }
             return Ok(());
         }
+        let output = self
+            .toplevels
+            .as_ref()
+            .and_then(|tracker| tracker.active_output());
+        self.map(phase, revision, output, qh);
+        Ok(())
+    }
+
+    fn map(
+        &mut self,
+        phase: Phase,
+        revision: u64,
+        output: Option<wl_output::WlOutput>,
+        qh: &QueueHandle<Self>,
+    ) {
         let wl = self.compositor.create_surface(qh, ());
         let region = self.compositor.create_region(qh, ());
         wl.set_input_region(Some(&region));
         region.destroy();
-        wl.set_buffer_scale(SCALE);
+        let scaling = self.scaling.as_ref().map(|(manager, viewporter)| {
+            let fractional = manager.get_fractional_scale(&wl, qh, ());
+            let viewport = viewporter.get_viewport(&wl, qh, ());
+            viewport.set_destination(WIDTH as i32, HEIGHT as i32);
+            (fractional, viewport)
+        });
+        if scaling.is_none() {
+            wl.set_buffer_scale((DEFAULT_SCALE / SCALE_UNIT) as i32);
+        }
+        let scale = if scaling.is_some() {
+            SCALE_UNIT
+        } else {
+            DEFAULT_SCALE
+        };
 
-        // With no output specified COSMIC picks its active seat's output.
+        // The active seat's output is the fallback if the window spans
+        // monitors or the toplevel protocol is unavailable.
         let role = self.shell.get_layer_surface(
             &wl,
-            None,
+            output.as_ref(),
             Layer::Overlay,
             "wispr-flow-dictation".into(),
             qh,
@@ -182,12 +243,14 @@ impl Overlay {
             phase,
             revision,
             configured: false,
+            output,
+            scaling,
+            scale,
         });
-        Ok(())
     }
 
     fn paint(shm: &wl_shm::WlShm, surface: &Surface, qh: &QueueHandle<Self>) -> Result<()> {
-        let pixmap = indicator(surface.phase)?;
+        let pixmap = indicator(surface.phase, surface.scale)?;
         let fd = memfd_create("wispr-flow-dictation", MemfdFlags::CLOEXEC)?;
         let mut file = std::fs::File::from(fd);
         let mut argb = Vec::with_capacity(pixmap.data().len());
@@ -212,16 +275,24 @@ impl Overlay {
         surface.wl.attach(Some(&buffer), 0, 0);
         surface.wl.damage(0, 0, WIDTH as i32, HEIGHT as i32);
         // Keep the Electron fallback until the compositor services a frame.
-        surface.wl.frame(qh, surface.revision);
+        surface.wl.frame(
+            qh,
+            Frame {
+                surface: surface.wl.id(),
+                revision: surface.revision,
+            },
+        );
         surface.wl.commit();
         Ok(())
     }
 }
 
-fn indicator(phase: Phase) -> Result<Pixmap> {
-    let transform = Transform::from_scale(SCALE as f32, SCALE as f32);
-    let mut pixmap = Pixmap::new(WIDTH * SCALE as u32, HEIGHT * SCALE as u32)
-        .ok_or("could not allocate overlay buffer")?;
+fn indicator(phase: Phase, scale: u32) -> Result<Pixmap> {
+    let width = (WIDTH * scale).div_ceil(SCALE_UNIT);
+    let height = (HEIGHT * scale).div_ceil(SCALE_UNIT);
+    let transform =
+        Transform::from_scale(width as f32 / WIDTH as f32, height as f32 / HEIGHT as f32);
+    let mut pixmap = Pixmap::new(width, height).ok_or("could not allocate overlay buffer")?;
     let mut paint = Paint {
         anti_alias: true,
         ..Paint::default()
@@ -243,7 +314,11 @@ fn indicator(phase: Phase) -> Result<Pixmap> {
         Phase::Starting | Phase::Processing => {
             for (x, alpha) in [(26.0, 155), (34.0, 204), (42.0, 255)] {
                 let dot = PathBuilder::from_circle(x, 16.0, 2.4).ok_or("invalid dot")?;
-                paint.set_color_rgba8(205, 217, 245, alpha);
+                if matches!(phase, Phase::Starting) {
+                    paint.set_color_rgba8(255, 203, 125, alpha);
+                } else {
+                    paint.set_color_rgba8(205, 217, 245, alpha);
+                }
                 pixmap.fill_path(&dot, &paint, tiny_skia::FillRule::Winding, transform, None);
             }
         }
@@ -285,11 +360,19 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for Overlay {
                 Self::paint(&overlay.shm, surface, qh)
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                let result = writeln!(io::stdout().lock(), "{} lost", surface.revision);
+                let (revision, phase, had_output) =
+                    (surface.revision, surface.phase, surface.output.is_some());
                 if let Some(surface) = overlay.surface.take() {
                     surface.destroy();
                 }
-                result.map_err(Into::into)
+                if had_output {
+                    // A disconnected output closes its layer surfaces.
+                    // Retry once via the active seat before using Electron.
+                    overlay.map(phase, revision, None, qh);
+                    Ok(())
+                } else {
+                    writeln!(io::stdout().lock(), "{revision} lost").map_err(Into::into)
+                }
             }
             _ => Ok(()),
         };
@@ -299,21 +382,51 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for Overlay {
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, u64> for Overlay {
+impl Dispatch<WpFractionalScaleV1, ()> for Overlay {
+    fn event(
+        overlay: &mut Self,
+        proxy: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        let wp_fractional_scale_v1::Event::PreferredScale { scale } = event else {
+            return;
+        };
+        let Some(surface) = overlay.surface.as_mut().filter(|surface| {
+            surface
+                .scaling
+                .as_ref()
+                .is_some_and(|(fractional, _)| fractional == proxy)
+        }) else {
+            return;
+        };
+        let scale = scale.clamp(SCALE_UNIT / 2, 8 * SCALE_UNIT);
+        if surface.scale != scale {
+            surface.scale = scale;
+            if surface.configured {
+                if let Err(error) = Overlay::paint(&overlay.shm, surface, qh) {
+                    overlay.error = Some(error);
+                }
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, Frame> for Overlay {
     fn event(
         overlay: &mut Self,
         _: &wl_callback::WlCallback,
         _: wl_callback::Event,
-        revision: &u64,
+        frame: &Frame,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if overlay
-            .surface
-            .as_ref()
-            .is_some_and(|surface| surface.revision == *revision)
-        {
-            if let Err(error) = writeln!(io::stdout().lock(), "{revision} shown") {
+        if overlay.surface.as_ref().is_some_and(|surface| {
+            surface.revision == frame.revision && surface.wl.id() == frame.surface
+        }) {
+            if let Err(error) = writeln!(io::stdout().lock(), "{} shown", frame.revision) {
                 overlay.error = Some(error.into());
             }
         }
@@ -353,3 +466,18 @@ delegate_noop!(Overlay: ignore wl_shm::WlShm);
 delegate_noop!(Overlay: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(Overlay: ignore wl_surface::WlSurface);
 delegate_noop!(Overlay: ignore ZwlrLayerShellV1);
+
+delegate_noop!(Overlay: ignore WpFractionalScaleManagerV1);
+delegate_noop!(Overlay: ignore WpViewporter);
+delegate_noop!(Overlay: ignore WpViewport);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fractional_scale_preserves_logical_size() {
+        let image = indicator(Phase::Listening, 150).unwrap();
+        assert_eq!((image.width(), image.height()), (85, 40));
+    }
+}

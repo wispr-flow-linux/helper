@@ -37,8 +37,9 @@ zbus = "4"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["staging", "client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+cosmic-protocols = { version = "0.2", default-features = false, features = ["client"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std"] }
-rustix = { version = "1", features = ["event", "fs"] }
+rustix = { version = "1", features = ["event", "fs", "pipe"] }
 
 # AT-SPI2 selection reads (backend::atspi_sel): the non-destructive path for
 # GetSelectedTextViaCopy — query the focused accessible's Text interface over the

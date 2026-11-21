@@ -3,11 +3,11 @@
 //! Injection uses an in-process uinput virtual keyboard (`uinput.rs`) — real
 //! kernel input events the compositor routes to the focused surface, which is
 //! the only compositor-agnostic way to synthesize input on Wayland (XTEST does
-//! not reach native Wayland windows). Clipboard uses `wl-clipboard`
-//! (`wl-copy`/`wl-paste`).
+//! not reach native Wayland windows). Clipboard uses ext-data-control, with
+//! `wl-clipboard` as a fallback.
 //!
 //! Implemented:
-//!   * PasteText        — wl-copy the text, then uinput Ctrl+V
+//!   * PasteText        — clipboard selection and uinput Ctrl+V
 //!   * SimulateKeyPress — VK -> evdev (keymap.rs) -> uinput chord
 //!   * GetSelectedText  — copy-probe: save clipboard, uinput Ctrl+C, read, restore
 //!   * GetAccessibilityStatus — true when uinput is usable
@@ -20,8 +20,6 @@
 //!     not possible from a virtual device: a uinput keyboard cannot clear a key
 //!     held on a different device, and trying strands the modifier instead. See
 //!     `backend::uinput::UInput::chord`.
-//!   * Simultaneous text/plain + text/html clipboard offer (wl-copy sets one
-//!     payload); we offer plain text, which is what paste targets read (TODO).
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -29,8 +27,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::uinput::UInput;
+use super::wl_clipboard::{self, Offer};
 use super::{ActiveApp, Backend, Result, RunningApp, Selection};
 use crate::keymap;
+use crate::settings::ClipboardMode;
 
 /// Wayland injection + clipboard + selection. Active-app identity is **not**
 /// handled here: `detect()` selects an `ActiveAppProvider` (KWin / GNOME ext /
@@ -59,35 +59,19 @@ impl WaylandBackend {
         })
     }
 
-    /// Set the clipboard, offering plain text plus (optionally) HTML. Prefers the
-    /// in-process ext-data-control owner (a single source advertising both MIME
-    /// types, like the Windows helper's dual CF_*); falls back to `wl-copy`
-    /// (plain text only) if the protocol isn't available.
-    fn clipboard_set_rich(&self, text: &str, html: Option<&str>) -> Result<()> {
-        let mut offers: Vec<super::wl_clipboard::Offer> = vec![(
-            "text/plain;charset=utf-8".to_string(),
-            text.as_bytes().to_vec(),
-        )];
-        if let Some(h) = html {
-            offers.push(("text/html".to_string(), h.as_bytes().to_vec()));
-        }
-        match super::wl_clipboard::set_clipboard(offers) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if self.has_wl_copy {
-                    log::warn!("in-process clipboard unavailable ({e}); falling back to wl-copy (plain text only)");
-                    run_with_stdin("wl-copy", &["--type", "text/plain;charset=utf-8"], text)
-                } else {
-                    Err(format!(
-                        "clipboard set failed ({e}) and no wl-copy fallback"
-                    ))
-                }
-            }
-        }
-    }
-
     fn clipboard_set(&self, text: &str) -> Result<()> {
         self.clipboard_set_rich(text, None)
+    }
+
+    fn clipboard_set_rich(&self, text: &str, html: Option<&str>) -> Result<()> {
+        match wl_clipboard::set_clipboard(paste_offers(text, html)) {
+            Ok(()) => Ok(()),
+            Err(e) if self.has_wl_copy => {
+                log::warn!("in-process clipboard unavailable ({e}); falling back to wl-copy");
+                run_with_stdin("wl-copy", &["--type", "text/plain;charset=utf-8"], text)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn clipboard_get(&self) -> Result<String> {
@@ -99,16 +83,94 @@ impl WaylandBackend {
     }
 }
 
+fn paste_offers(text: &str, html: Option<&str>) -> Vec<Offer> {
+    let mut offers = vec![("text/plain;charset=utf-8".into(), text.as_bytes().to_vec())];
+    if let Some(html) = html {
+        offers.push(("text/html".into(), html.as_bytes().to_vec()));
+    }
+    offers
+}
+
+fn terminal_app(app_id: &str) -> bool {
+    let id = app_id.to_ascii_lowercase();
+    let id = id.strip_suffix(".desktop").unwrap_or(&id);
+    matches!(
+        id,
+        "com.system76.cosmicterm"
+            | "cosmic-term"
+            | "com.mitchellh.ghostty"
+            | "ghostty"
+            | "alacritty"
+            | "alacritty.alacritty"
+            | "org.alacritty.alacritty"
+            | "kitty"
+            | "net.kovidgoyal.kitty"
+            | "org.gnome.terminal"
+            | "gnome-terminal"
+            | "org.gnome.console"
+            | "org.kde.konsole"
+            | "konsole"
+    )
+}
+
+impl WaylandBackend {
+    fn paste_with_modifiers(
+        &mut self,
+        text: &str,
+        html: Option<&str>,
+        terminal: bool,
+        still_focused: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let ctrl = keymap::flag_to_evdev("Control").ok_or("no evdev for Control")?;
+        let v = keymap::vk_to_evdev(b'V' as u32).ok_or("no evdev for V")?;
+        let shift = keymap::flag_to_evdev("Shift").ok_or("no evdev for Shift")?;
+        let restore = if ClipboardMode::read()? == ClipboardMode::Preserve {
+            Some(
+                wl_clipboard::prepare_paste(paste_offers(text, html))
+                    .map_err(|error| format!("{error}; use Wispr Flow History"))?
+                    .ok_or("preserving the clipboard requires Wayland ext-data-control")?,
+            )
+        } else {
+            self.clipboard_set_rich(text, html)?;
+            None
+        };
+        // Give the focused client time to process the new selection before Ctrl+V.
+        std::thread::sleep(Duration::from_millis(30));
+        let paste = if !still_focused() {
+            Err("focused window changed before paste; use Wispr Flow History".into())
+        } else if terminal {
+            self.uinput.chord(v, &[ctrl, shift])
+        } else {
+            self.uinput.chord(v, &[ctrl])
+        };
+        if let Some(restore) = restore {
+            if let Err(e) = restore
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|e| e.to_string())
+                .and_then(|result| result)
+            {
+                // The target may already have pasted, so do not report a
+                // paste failure or risk duplicate insertion on retry.
+                log::warn!("could not restore clipboard after paste: {e}");
+            }
+        }
+        paste
+    }
+}
+
 impl Backend for WaylandBackend {
     fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()> {
-        // Offer text/plain (+ text/html when supplied), like the Windows helper's
-        // dual-format clipboard, then synthesize Ctrl+V.
-        self.clipboard_set_rich(text, html)?;
-        // Let the new selection owner register before Ctrl+V reads it.
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        let ctrl = keymap::flag_to_evdev("Control").unwrap();
-        let v = keymap::vk_to_evdev(b'V' as u32).ok_or("no evdev for V")?;
-        self.uinput.chord(v, &[ctrl])
+        self.paste_with_modifiers(text, html, false, &|| true)
+    }
+
+    fn paste_text_for_app(
+        &mut self,
+        text: &str,
+        html: Option<&str>,
+        app: &ActiveApp,
+        still_focused: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.paste_with_modifiers(text, html, terminal_app(&app.bundle_id), still_focused)
     }
 
     fn simulate_key_press(&mut self, keycode_vk: u32, flags: &[String]) -> Result<()> {
@@ -142,6 +204,11 @@ impl Backend for WaylandBackend {
             Ok(Some(sel)) => return Ok(sel),
             Ok(None) => log::debug!("AT-SPI: no selection, falling back to copy-probe"),
             Err(e) => log::debug!("AT-SPI unavailable ({e}); falling back to copy-probe"),
+        }
+        // A Ctrl+C probe can destroy rich data even when no text was selected.
+        // Preserve mode only uses the non-destructive accessibility path.
+        if ClipboardMode::read()? == ClipboardMode::Preserve {
+            return Ok(Selection::default());
         }
         // Copy-probe fallback: save clipboard, synth Ctrl+C, read, restore.
         // Approximate and destructive-then-restored.
@@ -260,5 +327,18 @@ fn run_capture(prog: &str, args: &[&str]) -> Result<String> {
             }
             Err(e) => return Err(format!("wait {prog}: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_paste_uses_known_desktop_ids_only() {
+        assert!(terminal_app("com.system76.CosmicTerm.desktop"));
+        assert!(terminal_app("com.mitchellh.ghostty"));
+        assert!(!terminal_app("com.system76.CosmicEdit"));
+        assert!(!terminal_app("my-ghostty-notes"));
     }
 }

@@ -15,6 +15,7 @@ pub mod uinput;
 pub mod wayland;
 pub mod wl_clipboard;
 pub mod x11;
+pub mod xkb;
 
 pub type Result<T> = std::result::Result<T, String>;
 

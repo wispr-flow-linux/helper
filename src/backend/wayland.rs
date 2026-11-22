@@ -8,7 +8,7 @@
 //!
 //! Implemented:
 //!   * PasteText        — wl-copy the text, then uinput Ctrl+V
-//!   * SimulateKeyPress — VK -> evdev (keymap.rs) -> uinput chord
+//!   * SimulateKeyPress — VK -> evdev (keymap.rs / xkb.rs) -> uinput chord
 //!   * GetSelectedText  — copy-probe: save clipboard, uinput Ctrl+C, read, restore
 //!   * GetAccessibilityStatus — true when uinput is usable
 //!
@@ -29,6 +29,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::uinput::UInput;
+use super::xkb::XkbResolver;
 use super::{ActiveApp, Backend, Result, RunningApp, Selection};
 use crate::keymap;
 
@@ -41,6 +42,7 @@ pub struct WaylandBackend {
     uinput: UInput,
     has_wl_copy: bool,
     has_wl_paste: bool,
+    xkb: XkbResolver,
 }
 
 impl WaylandBackend {
@@ -52,10 +54,21 @@ impl WaylandBackend {
             log::warn!("wl-clipboard not fully present (wl-copy={has_wl_copy}, wl-paste={has_wl_paste}) — \
                         PasteText/selection ops need both; install `wl-clipboard`");
         }
+        let xkb = XkbResolver::detect();
+        log::info!(
+            "Wayland XKB resolver initialized: ctrl={}, alt={}, meta={}, paste_v={}, options={:?}, layout={}",
+            xkb.ctrl_evdev(),
+            xkb.alt_evdev(),
+            xkb.meta_evdev(),
+            xkb.paste_v_key(),
+            xkb.options,
+            xkb.layout
+        );
         Ok(WaylandBackend {
             uinput,
             has_wl_copy,
             has_wl_paste,
+            xkb,
         })
     }
 
@@ -106,8 +119,8 @@ impl Backend for WaylandBackend {
         self.clipboard_set_rich(text, html)?;
         // Let the new selection owner register before Ctrl+V reads it.
         std::thread::sleep(std::time::Duration::from_millis(30));
-        let ctrl = keymap::flag_to_evdev("Control").unwrap();
-        let v = keymap::vk_to_evdev(b'V' as u32).ok_or("no evdev for V")?;
+        let ctrl = self.xkb.modifier_to_evdev("Control").unwrap_or(29);
+        let v = self.xkb.paste_v_key();
         self.uinput.chord(v, &[ctrl])
     }
 
@@ -116,7 +129,11 @@ impl Backend for WaylandBackend {
             .ok_or_else(|| format!("unmapped VK {keycode_vk} (no evdev code)"))?;
         let mods: Vec<u16> = flags
             .iter()
-            .filter_map(|f| keymap::flag_to_evdev(f))
+            .filter_map(|f| {
+                self.xkb
+                    .modifier_to_evdev(f)
+                    .or_else(|| keymap::flag_to_evdev(f))
+            })
             .collect();
         // Modifiers the user is physically holding are deliberately left alone;
         // a virtual device cannot release them. See `UInput::chord`.
@@ -146,8 +163,8 @@ impl Backend for WaylandBackend {
         // Copy-probe fallback: save clipboard, synth Ctrl+C, read, restore.
         // Approximate and destructive-then-restored.
         let saved = self.clipboard_get().unwrap_or_default();
-        let ctrl = keymap::flag_to_evdev("Control").unwrap();
-        let c = keymap::vk_to_evdev(b'C' as u32).ok_or("no evdev for C")?;
+        let ctrl = self.xkb.modifier_to_evdev("Control").unwrap_or(29);
+        let c = self.xkb.copy_c_key();
         self.uinput.chord(c, &[ctrl])?;
         std::thread::sleep(std::time::Duration::from_millis(80));
         let selected = self.clipboard_get().unwrap_or_default();

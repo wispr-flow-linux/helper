@@ -350,10 +350,61 @@ fn snapshot(
         ));
     }
 
-    // Request all formats before reading so a slow owner cannot consume the
-    // entire deadline before the other formats are even requested.
-    let mut transfers = Vec::with_capacity(mimes.len());
-    for (order, mime) in mimes.into_iter().enumerate() {
+    let deadline = (Instant::now() + SNAPSHOT_TIMEOUT).min(deadline);
+    let (formats, aliases) = snapshot_formats(mimes);
+    if formats.is_empty() {
+        return Err("clipboard has no data formats to preserve".into());
+    }
+    let mut snapshot = Snapshot {
+        saved: Vec::with_capacity(formats.len() + aliases.len()),
+        remaining: MAX_SNAPSHOT_BYTES,
+    };
+    let transfers = request_formats(queue, &offer, formats)?;
+    read_snapshot(transfers, deadline, &mut snapshot)?;
+
+    if !aliases.is_empty() {
+        // Read X11 aliases after the real data. Some owners serialize these
+        // conversions and stall the substantive transfers in the same batch.
+        let transfers = request_formats(queue, &offer, aliases)?;
+        read_snapshot(transfers, deadline, &mut snapshot)?;
+    }
+
+    queue.roundtrip(state).map_err(|e| e.to_string())?;
+    if state.selection.as_ref() != Some(&offer) {
+        return Err("clipboard changed while taking its snapshot".into());
+    }
+    Ok(snapshot.into_offers())
+}
+
+type SnapshotFormat = (usize, String);
+
+fn snapshot_formats(mimes: Vec<String>) -> (Vec<SnapshotFormat>, Vec<SnapshotFormat>) {
+    let aliases_are_redundant = mimes.iter().any(|mime| mime == "SAVE_TARGETS")
+        && mimes
+            .iter()
+            .any(|mime| matches!(mime.as_str(), "UTF8_STRING" | "text/plain;charset=utf-8"));
+    mimes
+        .into_iter()
+        .enumerate()
+        // SAVE_TARGETS requests clipboard persistence on X11. It carries
+        // no data and some owners leave its transfer pipe open.
+        .filter(|(_, mime)| mime != "SAVE_TARGETS")
+        .partition(|(_, mime)| {
+            !aliases_are_redundant
+                || !matches!(
+                    mime.as_str(),
+                    "text/plain" | "COMPOUND_TEXT" | "TEXT" | "STRING"
+                )
+        })
+}
+
+fn request_formats(
+    queue: &mut EventQueue<State>,
+    offer: &ExtDataControlOfferV1,
+    formats: Vec<SnapshotFormat>,
+) -> Result<Vec<Transfer>> {
+    let mut transfers = Vec::with_capacity(formats.len());
+    for (order, mime) in formats {
         let (reader, writer) = pipe_with(PipeFlags::CLOEXEC).map_err(|e| e.to_string())?;
         offer.receive(mime.clone(), writer.as_fd());
         transfers.push(Transfer {
@@ -364,17 +415,19 @@ fn snapshot(
         });
     }
     queue.flush().map_err(|e| e.to_string())?;
-    let saved = read_snapshot(
-        transfers,
-        (Instant::now() + SNAPSHOT_TIMEOUT).min(deadline),
-        MAX_SNAPSHOT_BYTES,
-    )?;
+    Ok(transfers)
+}
 
-    queue.roundtrip(state).map_err(|e| e.to_string())?;
-    if state.selection.as_ref() != Some(&offer) {
-        return Err("clipboard changed while taking its snapshot".into());
+struct Snapshot {
+    saved: Vec<(usize, Offer)>,
+    remaining: usize,
+}
+
+impl Snapshot {
+    fn into_offers(mut self) -> Vec<Offer> {
+        self.saved.sort_unstable_by_key(|(order, _)| *order);
+        self.saved.into_iter().map(|(_, offer)| offer).collect()
     }
-    Ok(saved)
 }
 
 struct Transfer {
@@ -387,9 +440,8 @@ struct Transfer {
 fn read_snapshot(
     mut transfers: Vec<Transfer>,
     deadline: Instant,
-    mut remaining: usize,
-) -> Result<Vec<Offer>> {
-    let mut saved = Vec::with_capacity(transfers.len());
+    snapshot: &mut Snapshot,
+) -> Result<()> {
     let mut buffer = [0; 8192];
     while !transfers.is_empty() {
         let ready: Vec<_> = {
@@ -398,7 +450,7 @@ fn read_snapshot(
                 .map(|transfer| PollFd::new(&transfer.reader, PollFlags::IN))
                 .collect();
             if !wait_fds(&mut fds, deadline)? {
-                recover_stalled_text_formats(&mut saved, &transfers, remaining)?;
+                recover_stalled_text_formats(snapshot, &transfers)?;
                 break;
             }
             fds.iter().map(PollFd::revents).collect()
@@ -415,24 +467,23 @@ fn read_snapshot(
             };
             if count == 0 {
                 let transfer = transfers.swap_remove(index);
-                saved.push((transfer.order, (transfer.mime, transfer.data)));
+                snapshot
+                    .saved
+                    .push((transfer.order, (transfer.mime, transfer.data)));
             } else {
-                remaining = remaining
+                snapshot.remaining = snapshot
+                    .remaining
                     .checked_sub(count)
                     .ok_or("clipboard snapshot too large")?;
                 transfers[index].data.extend_from_slice(&buffer[..count]);
             }
         }
     }
-    saved.sort_unstable_by_key(|(order, _)| *order);
-    Ok(saved.into_iter().map(|(_, offer)| offer).collect())
+    Ok(())
 }
 
-fn recover_stalled_text_formats(
-    saved: &mut Vec<(usize, Offer)>,
-    stalled: &[Transfer],
-    remaining: usize,
-) -> Result<()> {
+fn recover_stalled_text_formats(snapshot: &mut Snapshot, stalled: &[Transfer]) -> Result<()> {
+    let saved = &mut snapshot.saved;
     // COSMIC/XWayland can advertise legacy aliases for browser text even
     // when the owner cannot deliver them. Try them normally first. Keep a
     // snapshot only when we have valid UTF-8 and every missing flavor is a
@@ -448,11 +499,21 @@ fn recover_stalled_text_formats(
     let has_html = saved
         .iter()
         .any(|(_, (mime, data))| mime == "text/html" && !data.is_empty());
+    // Firefox also offers its private URL flavor when the public copy
+    // is a plain URL, with no HTML. Keep the public link in that case.
+    let has_plain_url = utf8
+        .and_then(|data| std::str::from_utf8(data).ok())
+        .and_then(|text| text.split_once("://"))
+        .is_some_and(|(scheme, rest)| {
+            matches!(scheme, "http" | "https" | "file" | "ftp")
+                && !rest.is_empty()
+                && !rest.chars().any(char::is_whitespace)
+        });
     let optional = |transfer: &Transfer| {
         transfer.data.is_empty()
             && match transfer.mime.as_str() {
-                "text/plain" | "COMPOUND_TEXT" | "TEXT" | "STRING" | "SAVE_TARGETS" => true,
-                "text/x-moz-url-priv" => has_html,
+                "text/plain" | "COMPOUND_TEXT" | "TEXT" | "STRING" => true,
+                "text/x-moz-url-priv" => has_html || has_plain_url,
                 _ => false,
             }
     };
@@ -465,9 +526,10 @@ fn recover_stalled_text_formats(
 
     // Some Wayland consumers request only the bare MIME name.
     if let Some(plain) = stalled.iter().find(|offer| offer.mime == "text/plain") {
-        if utf8.len() > remaining {
-            return Err("clipboard snapshot too large".into());
-        }
+        snapshot.remaining = snapshot
+            .remaining
+            .checked_sub(utf8.len())
+            .ok_or("clipboard snapshot too large")?;
         saved.push((plain.order, (plain.mime.clone(), utf8.clone())));
     }
     log::debug!(
@@ -639,6 +701,77 @@ mod tests {
         )
     }
 
+    fn collect_snapshot(
+        transfers: Vec<Transfer>,
+        deadline: Instant,
+        remaining: usize,
+    ) -> Result<Vec<Offer>> {
+        let mut snapshot = Snapshot {
+            saved: Vec::new(),
+            remaining,
+        };
+        read_snapshot(transfers, deadline, &mut snapshot)?;
+        Ok(snapshot.into_offers())
+    }
+
+    #[test]
+    fn snapshot_defers_bridged_text_aliases_and_excludes_x11_control_targets() {
+        let mimes = [
+            "text/plain",
+            "SAVE_TARGETS",
+            "UTF8_STRING",
+            "COMPOUND_TEXT",
+            "text/x-moz-url-priv",
+            "image/png",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let (formats, aliases) = snapshot_formats(mimes);
+        assert_eq!(
+            formats,
+            vec![
+                (2, "UTF8_STRING".into()),
+                (4, "text/x-moz-url-priv".into()),
+                (5, "image/png".into())
+            ]
+        );
+        assert_eq!(
+            aliases,
+            vec![(0, "text/plain".into()), (3, "COMPOUND_TEXT".into())]
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_plain_firefox_links_with_a_stalled_private_format() {
+        let (public, mut writer) = transfer("UTF8_STRING");
+        let link = b"https://example.invalid/item";
+        writer.write_all(link).unwrap();
+        drop(writer);
+        let (private, _private_writer) = transfer("text/x-moz-url-priv");
+        let saved = collect_snapshot(
+            vec![private, public],
+            Instant::now() + Duration::from_millis(50),
+            128,
+        )
+        .unwrap();
+        assert_eq!(saved, vec![("UTF8_STRING".into(), link.to_vec())]);
+    }
+
+    #[test]
+    fn snapshot_requires_private_browser_data_without_a_public_url_or_html() {
+        let (public, mut writer) = transfer("UTF8_STRING");
+        writer.write_all(b"ordinary text").unwrap();
+        drop(writer);
+        let (private, _private_writer) = transfer("text/x-moz-url-priv");
+        assert!(collect_snapshot(
+            vec![private, public],
+            Instant::now() + Duration::from_millis(50),
+            128,
+        )
+        .unwrap_err()
+        .contains("timed out"));
+    }
+
     #[test]
     fn snapshot_services_another_pipe_while_the_first_waits() {
         let (first, mut first_writer) = transfer("text/plain");
@@ -652,7 +785,7 @@ mod tests {
             drop(second_writer);
             first_writer.write_all(b"before").unwrap();
         });
-        let mut snapshot = read_snapshot(
+        let mut snapshot = collect_snapshot(
             vec![first, second],
             Instant::now() + Duration::from_secs(2),
             512 * 1024,
@@ -697,7 +830,7 @@ mod tests {
         let (plain, _plain_writer) = transfer("text/plain");
         let (legacy, _legacy_writer) = transfer("COMPOUND_TEXT");
         let (private, _private_writer) = transfer("text/x-moz-url-priv");
-        let mut saved = read_snapshot(
+        let mut saved = collect_snapshot(
             vec![plain, legacy, private, html, utf8],
             Instant::now() + Duration::from_millis(50),
             128,
@@ -723,7 +856,7 @@ mod tests {
         writer.write_all(b"sample").unwrap();
         drop(writer);
         let (image, _image_writer) = transfer("image/png");
-        assert!(read_snapshot(
+        assert!(collect_snapshot(
             vec![utf8, image],
             Instant::now() + Duration::from_millis(50),
             128,
@@ -735,14 +868,14 @@ mod tests {
     #[test]
     fn snapshot_rejects_a_stalled_owner_and_oversized_data() {
         let (stalled, _writer) = transfer("text/plain");
-        assert!(read_snapshot(vec![stalled], Instant::now(), 64)
+        assert!(collect_snapshot(vec![stalled], Instant::now(), 64)
             .unwrap_err()
             .contains("timed out"));
         let (large, mut writer) = transfer("application/octet-stream");
         writer.write_all(b"too large").unwrap();
         drop(writer);
         assert_eq!(
-            read_snapshot(vec![large], Instant::now() + Duration::from_secs(1), 4),
+            collect_snapshot(vec![large], Instant::now() + Duration::from_secs(1), 4),
             Err("clipboard snapshot too large".into())
         );
     }

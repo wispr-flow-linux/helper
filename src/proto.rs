@@ -152,7 +152,13 @@ pub fn ack(uuid: &str) -> Value {
 pub fn error(description: &str, uuid: &str) -> Value {
     response(
         "HelperAPIError",
-        json!({ "payload": { "type": "", "description": description, "params": {} } }),
+        json!({
+            "payload": {
+                "type": "SOME_ERROR_TYPES",
+                "description": description,
+                "params": {}
+            }
+        }),
         uuid,
     )
 }
@@ -160,6 +166,25 @@ pub fn error(description: &str, uuid: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_matches_the_app_response_schema() {
+        assert_eq!(
+            error("focused window changed", "test-id"),
+            json!({
+                "HelperAPIResponse": {
+                    "HelperAPIError": {
+                        "payload": {
+                            "type": "SOME_ERROR_TYPES",
+                            "description": "focused window changed",
+                            "params": {}
+                        }
+                    },
+                    "uuid": "test-id"
+                }
+            })
+        );
+    }
 
     #[test]
     fn escape_roundtrip() {

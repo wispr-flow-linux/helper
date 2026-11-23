@@ -398,10 +398,8 @@ fn read_snapshot(
                 .map(|transfer| PollFd::new(&transfer.reader, PollFlags::IN))
                 .collect();
             if !wait_fds(&mut fds, deadline)? {
-                return Err(format!(
-                    "clipboard snapshot timed out ({} format(s) still pending)",
-                    transfers.len()
-                ));
+                recover_stalled_text_formats(&mut saved, &transfers, remaining)?;
+                break;
             }
             fds.iter().map(PollFd::revents).collect()
         };
@@ -428,6 +426,55 @@ fn read_snapshot(
     }
     saved.sort_unstable_by_key(|(order, _)| *order);
     Ok(saved.into_iter().map(|(_, offer)| offer).collect())
+}
+
+fn recover_stalled_text_formats(
+    saved: &mut Vec<(usize, Offer)>,
+    stalled: &[Transfer],
+    remaining: usize,
+) -> Result<()> {
+    // COSMIC/XWayland can advertise legacy aliases for browser text even
+    // when the owner cannot deliver them. Try them normally first. Keep a
+    // snapshot only when we have valid UTF-8 and every missing flavor is a
+    // known alias or private metadata for an already captured rich-text copy.
+    let utf8 = ["text/plain;charset=utf-8", "UTF8_STRING"]
+        .into_iter()
+        .find_map(|mime| {
+            saved.iter().find_map(|(_, (name, data))| {
+                (name == mime && !data.is_empty() && std::str::from_utf8(data).is_ok())
+                    .then_some(data)
+            })
+        });
+    let has_html = saved
+        .iter()
+        .any(|(_, (mime, data))| mime == "text/html" && !data.is_empty());
+    let optional = |transfer: &Transfer| {
+        transfer.data.is_empty()
+            && match transfer.mime.as_str() {
+                "text/plain" | "COMPOUND_TEXT" | "TEXT" | "STRING" | "SAVE_TARGETS" => true,
+                "text/x-moz-url-priv" => has_html,
+                _ => false,
+            }
+    };
+    let Some(utf8) = utf8.filter(|_| stalled.iter().all(optional)) else {
+        return Err(format!(
+            "clipboard snapshot timed out ({} format(s) still pending)",
+            stalled.len()
+        ));
+    };
+
+    // Some Wayland consumers request only the bare MIME name.
+    if let Some(plain) = stalled.iter().find(|offer| offer.mime == "text/plain") {
+        if utf8.len() > remaining {
+            return Err("clipboard snapshot too large".into());
+        }
+        saved.push((plain.order, (plain.mime.clone(), utf8.clone())));
+    }
+    log::debug!(
+        "preserved clipboard text after {} optional formats stalled",
+        stalled.len()
+    );
+    Ok(())
 }
 
 fn dispatch_paste_window(queue: &mut EventQueue<State>, state: &mut State) -> Result<()> {
@@ -637,6 +684,52 @@ mod tests {
         let mut received = Vec::new();
         File::from(reader).read_to_end(&mut received).unwrap();
         assert_eq!(received, data);
+    }
+
+    #[test]
+    fn snapshot_recovers_browser_text_when_legacy_targets_stall() {
+        let (utf8, mut utf8_writer) = transfer("text/plain;charset=utf-8");
+        utf8_writer.write_all("café".as_bytes()).unwrap();
+        drop(utf8_writer);
+        let (html, mut html_writer) = transfer("text/html");
+        html_writer.write_all(b"<b>sample</b>").unwrap();
+        drop(html_writer);
+        let (plain, _plain_writer) = transfer("text/plain");
+        let (legacy, _legacy_writer) = transfer("COMPOUND_TEXT");
+        let (private, _private_writer) = transfer("text/x-moz-url-priv");
+        let mut saved = read_snapshot(
+            vec![plain, legacy, private, html, utf8],
+            Instant::now() + Duration::from_millis(50),
+            128,
+        )
+        .unwrap();
+        saved.sort();
+        assert_eq!(
+            saved,
+            vec![
+                ("text/html".into(), b"<b>sample</b>".to_vec()),
+                ("text/plain".into(), "café".as_bytes().to_vec()),
+                (
+                    "text/plain;charset=utf-8".into(),
+                    "café".as_bytes().to_vec()
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_still_rejects_a_stalled_unique_format_with_readable_text() {
+        let (utf8, mut writer) = transfer("UTF8_STRING");
+        writer.write_all(b"sample").unwrap();
+        drop(writer);
+        let (image, _image_writer) = transfer("image/png");
+        assert!(read_snapshot(
+            vec![utf8, image],
+            Instant::now() + Duration::from_millis(50),
+            128,
+        )
+        .unwrap_err()
+        .contains("timed out"));
     }
 
     #[test]

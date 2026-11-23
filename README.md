@@ -137,8 +137,10 @@ Linux preferences. The helper reads the file on each paste. Preserve mode
 reads selections through AT-SPI. A separate Wayland owner retains restored
 data after the helper exits and stops when the selection changes. On systemd
 sessions it runs in its own user scope. Clipboard history managers can observe
-temporary selections. If a clipboard owner cannot provide a safe snapshot,
-use Flow History to recover the text.
+temporary selections. When a browser cannot serve a legacy text alias or
+private URL format, the helper can preserve the readable plain text and
+HTML. If a required format cannot be saved, use Flow History to recover
+the transcript.
 
 Automatic COSMIC dictation is bound to the window active at dictation start.
 If that window or the temporary clipboard selection changes before paste,
